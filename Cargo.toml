@@ -1,0 +1,47 @@
+[package]
+name = "ce-meet"
+version = "0.1.0"
+edition = "2024"
+description = "Real-time (Meet-like) WebRTC signaling over the CE mesh — rooms as pubsub topics, SDP/ICE exchange via mesh publish/subscribe, capability-gated rooms. An application built ON CE primitives, not part of the node."
+license = "MIT"
+repository = "https://github.com/ce-net/ce-meet"
+keywords = ["ce", "webrtc", "signaling", "meet", "p2p"]
+categories = ["command-line-utilities", "network-programming", "multimedia"]
+authors = ["Leif Rydenfalk <ledamecrydenfalk@gmail.com>"]
+
+# ce-meet is both a reusable library (the signaling protocol, room/roster state machine, the
+# capability gate and the TURN/ICE-server plan) and the `ce-meet` binary CLI over it. The library
+# is fully unit- and property-tested; the binary is a thin CLI.
+[lib]
+name = "ce_meet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ce-meet"
+path = "src/main.rs"
+
+[dependencies]
+# The CE SDK: mesh pubsub (subscribe/publish), directed messaging (send/request/reply),
+# discovery, status/atlas. The signaling plane is built entirely on these primitives.
+ce-rs = { path = "../ce-rs" }
+# The capability verifier primitive — a room host authorizes a signed attenuating chain before
+# admitting a peer or honoring a moderation action. Abilities are opaque app-chosen strings.
+ce-cap = { path = "../ce/crates/ce-cap" }
+# Identity provides the NodeId type the gate authorizes against (and hex parsing of node ids).
+ce-identity = { path = "../ce/crates/ce-identity" }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "5"
+
+[dev-dependencies]
+# Identity is needed by tests to forge capability chains and authenticated senders.
+ce-identity = { path = "../ce/crates/ce-identity" }
+proptest = "1"

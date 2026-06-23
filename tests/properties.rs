@@ -7,10 +7,12 @@
 //!
 //! These validate the invariants the foundation rests on, not just example cases.
 
+use ce_meet::order::OrderedInbox;
 use ce_meet::proto::{Signal, SignalEnvelope};
 use ce_meet::room::Room;
 use ce_meet::turn::TurnCredential;
 use proptest::prelude::*;
+use std::collections::BTreeSet;
 
 /// An arbitrary Signal.
 fn any_signal() -> impl Strategy<Value = Signal> {
@@ -145,5 +147,138 @@ proptest! {
     #[test]
     fn parser_never_panics_on_arbitrary_bytes(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
         let _ = SignalEnvelope::from_bytes(&bytes); // must not panic; Ok or Err both fine
+    }
+
+    /// Snapshot/restore is a no-op on convergent state: a room snapshotted mid-stream, restored, and
+    /// fed the remaining events ends in the SAME present-set as a room that processed every event
+    /// without interruption. (Persistent-state correctness under concurrent updates.)
+    #[test]
+    fn snapshot_restore_preserves_convergence(
+        events in proptest::collection::vec((0u8..4, 0u64..6, any::<bool>()), 1..10),
+        split in 0usize..10,
+    ) {
+        let to_env = |(m, seq, present): &(u8, u64, bool)| {
+            let from = format!("m{m}");
+            let signal = if *present { Signal::Join { display_name: None } } else { Signal::Leave };
+            (from, SignalEnvelope::broadcast("r", *seq, 0, signal))
+        };
+
+        // Uninterrupted reference.
+        let mut reference = Room::new("r", "me");
+        for ev in &events {
+            let (from, env) = to_env(ev);
+            reference.apply(&env.with_sender(&from));
+        }
+
+        // Snapshot after `split` events, restore, then apply the rest.
+        let cut = split.min(events.len());
+        let mut a = Room::new("r", "me");
+        for ev in &events[..cut] {
+            let (from, env) = to_env(ev);
+            a.apply(&env.with_sender(&from));
+        }
+        let snap = Room::restore(Room::restore(a.snapshot()).snapshot()); // double round-trip
+        let mut restored = snap;
+        for ev in &events[cut..] {
+            let (from, env) = to_env(ev);
+            restored.apply(&env.with_sender(&from));
+        }
+
+        prop_assert_eq!(restored.present(), reference.present());
+        prop_assert_eq!(restored.digest(), reference.digest());
+    }
+
+    /// Merging two replicas' snapshots converges: replica A applies a subset, replica B applies the
+    /// rest, then each merges the other's snapshot — both end at the same present-set as a replica
+    /// that applied everything. Merge is commutative and convergent (the CRDT law).
+    #[test]
+    fn merge_snapshots_converge(
+        events in proptest::collection::vec((0u8..4, 0u64..6, any::<bool>()), 1..10),
+        split in 0usize..10,
+    ) {
+        let to_env = |(m, seq, present): &(u8, u64, bool)| {
+            let from = format!("m{m}");
+            let signal = if *present { Signal::Join { display_name: None } } else { Signal::Leave };
+            (from, SignalEnvelope::broadcast("r", *seq, 0, signal))
+        };
+
+        let mut reference = Room::new("r", "me");
+        for ev in &events { let (f, e) = to_env(ev); reference.apply(&e.with_sender(&f)); }
+
+        let cut = split.min(events.len());
+        let mut a = Room::new("r", "me");
+        for ev in &events[..cut] { let (f, e) = to_env(ev); a.apply(&e.with_sender(&f)); }
+        let mut b = Room::new("r", "me");
+        for ev in &events[cut..] { let (f, e) = to_env(ev); b.apply(&e.with_sender(&f)); }
+
+        let sa = a.snapshot();
+        let sb = b.snapshot();
+        a.merge_snapshot(&sb);
+        b.merge_snapshot(&sa);
+
+        prop_assert_eq!(a.present(), reference.present());
+        prop_assert_eq!(b.present(), a.present());
+    }
+
+    /// SDP/ICE ordering: a contiguous run of seqs 0..n, delivered in ANY permutation with duplicates,
+    /// is released by the reorder buffer in strictly ascending seq order, exactly once each.
+    #[test]
+    fn ordered_inbox_delivers_in_order_under_any_permutation(
+        n in 1u64..12,
+        perm_seed in any::<u64>(),
+        dup_seed in any::<u64>(),
+    ) {
+        // Build envelopes for seqs 0..n.
+        let mk = |seq: u64| SignalEnvelope::directed("r", "me", seq, seq, Signal::IceCandidate {
+            candidate: format!("c{seq}"), sdp_mid: None, sdp_m_line_index: None,
+        }).with_sender("peer");
+
+        // Deterministic shuffle: rotate then swap a pair, and duplicate one element.
+        let mut order: Vec<u64> = (0..n).collect();
+        let rot = (perm_seed as usize) % (n as usize);
+        order.rotate_left(rot);
+        if n >= 2 {
+            let i = (perm_seed as usize) % (n as usize);
+            let j = (dup_seed as usize) % (n as usize);
+            order.swap(i, j);
+        }
+        let dup = order[(dup_seed as usize) % order.len()];
+        order.push(dup); // a duplicate arrival
+
+        // Window must cover the whole run so a legitimate reorder is never force-skipped.
+        let mut inbox = OrderedInbox::with_window(n + 4);
+        let mut delivered: Vec<u64> = Vec::new();
+        for seq in order {
+            for out in inbox.offer(mk(seq)) {
+                delivered.push(out.seq);
+            }
+        }
+        // Every seq delivered exactly once, in strictly ascending order.
+        let expected: Vec<u64> = (0..n).collect();
+        prop_assert_eq!(&delivered, &expected);
+        // (cross-check: no duplicates, full set)
+        let as_set: BTreeSet<u64> = delivered.iter().copied().collect();
+        prop_assert_eq!(as_set.len(), n as usize);
+    }
+
+    /// The reorder buffer never emits a seq lower than one it already emitted (monotonic output),
+    /// for arbitrary arrival sequences (including gaps it may force-skip past). No resurrection of an
+    /// already-delivered or skipped seq.
+    #[test]
+    fn ordered_inbox_output_is_monotonic(
+        arrivals in proptest::collection::vec(0u64..20, 0..40),
+    ) {
+        let mk = |seq: u64| SignalEnvelope::directed("r", "me", seq, seq, Signal::IceEnd)
+            .with_sender("peer");
+        let mut inbox = OrderedInbox::with_window(8);
+        let mut last: Option<u64> = None;
+        for seq in arrivals {
+            for out in inbox.offer(mk(seq)) {
+                if let Some(prev) = last {
+                    prop_assert!(out.seq > prev, "output must strictly increase: {} after {}", out.seq, prev);
+                }
+                last = Some(out.seq);
+            }
+        }
     }
 }

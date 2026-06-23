@@ -187,7 +187,7 @@ impl SignalEnvelope {
 
 /// Admission request sent (via the SDK `request`/`reply` transport) by a joiner to a gated room's
 /// host. The host authorizes `caps` against [`ABILITY_JOIN`] before replying.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AdmitReq {
     /// The room being joined.
     pub room_id: String,
@@ -196,6 +196,10 @@ pub struct AdmitReq {
     /// Optional human display name to register in the roster.
     #[serde(default)]
     pub display_name: Option<String>,
+    /// A resume token from a prior admission, presented to skip the capability handshake on a
+    /// reconnect. When present and valid for the authenticated sender, the host re-admits by identity.
+    #[serde(default)]
+    pub resume: Option<ResumeToken>,
 }
 
 /// The host's reply to an [`AdmitReq`].
@@ -210,6 +214,36 @@ pub struct AdmitResp {
     /// for a pure peer-to-peer room with no relay. See [`crate::turn`].
     #[serde(default)]
     pub ice_servers: Vec<crate::turn::IceServer>,
+    /// A short-lived resume token the joiner presents to skip re-authorization on reconnect. `None`
+    /// when not admitted. The joiner stores it and, after a drop, re-attaches with it instead of
+    /// re-running the full capability handshake. See [`ResumeToken`].
+    #[serde(default)]
+    pub resume: Option<ResumeToken>,
+}
+
+/// A capability-gate resume token. After a participant is admitted to a gated room, the host issues
+/// one of these keyed to the participant's identity; on a later reconnect the participant presents it
+/// (in [`AdmitReq::resume`]) to be re-admitted **by identity** without re-presenting the full
+/// capability chain — as long as it has not expired and the participant is the same node.
+///
+/// It is not a bearer secret to a third party: the host re-derives and re-checks it against the
+/// authenticated reconnecting NodeId, so a stolen token used by a different node is rejected. The
+/// `seq_floor` carries the participant's last-known outbound sequence so the resumed session never
+/// re-uses a `seq` a peer would drop (see [`crate::room::Room::resume_outbound_from`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeToken {
+    /// The room this token is valid for.
+    pub room_id: String,
+    /// The NodeId (hex) the token was issued to — must equal the authenticated reconnecting sender.
+    pub node_id: String,
+    /// Unix seconds after which the token no longer resumes (the joiner must re-handshake).
+    pub expires_at: u64,
+    /// The participant's last-known outbound `seq` floor, restored on resume to preserve monotonicity.
+    #[serde(default)]
+    pub seq_floor: u64,
+    /// Host-derived MAC over `(room_id, node_id, expires_at, seq_floor)` so the host verifies a token
+    /// it issued without storing per-participant state. Hex-encoded.
+    pub mac: String,
 }
 
 #[cfg(test)]
@@ -285,5 +319,57 @@ mod tests {
         let back: Signal = serde_json::from_str(&j).unwrap();
         assert_eq!(offer, back);
         assert!(j.contains("\"kind\":\"offer\""));
+    }
+
+    #[test]
+    fn admit_req_round_trips_with_and_without_resume() {
+        let req = AdmitReq {
+            room_id: "r".into(),
+            caps: "abcd".into(),
+            display_name: Some("Leif".into()),
+            resume: None,
+        };
+        let back: AdmitReq = serde_json::from_slice(&serde_json::to_vec(&req).unwrap()).unwrap();
+        assert_eq!(back.room_id, "r");
+        assert!(back.resume.is_none());
+
+        let tok = ResumeToken {
+            room_id: "r".into(),
+            node_id: "ab".repeat(32),
+            expires_at: 5000,
+            seq_floor: 9,
+            mac: "deadbeef".into(),
+        };
+        let req2 = AdmitReq { resume: Some(tok.clone()), ..Default::default() };
+        let back2: AdmitReq = serde_json::from_slice(&serde_json::to_vec(&req2).unwrap()).unwrap();
+        assert_eq!(back2.resume, Some(tok));
+    }
+
+    #[test]
+    fn admit_resp_round_trips_with_resume_and_ice() {
+        let resp = AdmitResp {
+            admitted: true,
+            reason: None,
+            ice_servers: vec![crate::turn::IceServer::stun("stun:x:3478")],
+            resume: Some(ResumeToken {
+                room_id: "r".into(),
+                node_id: "ff".repeat(32),
+                expires_at: 1000,
+                seq_floor: 0,
+                mac: "aa".into(),
+            }),
+        };
+        let back: AdmitResp = serde_json::from_slice(&serde_json::to_vec(&resp).unwrap()).unwrap();
+        assert!(back.admitted);
+        assert_eq!(back.ice_servers.len(), 1);
+        assert!(back.resume.is_some());
+    }
+
+    #[test]
+    fn admit_resp_default_is_denied_with_no_resume() {
+        let resp = AdmitResp::default();
+        assert!(!resp.admitted);
+        assert!(resp.resume.is_none());
+        assert!(resp.ice_servers.is_empty());
     }
 }

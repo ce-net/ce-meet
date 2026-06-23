@@ -6,8 +6,11 @@
 //! no ce-meet server. The host of a gated room runs the [`crate::caps::Gate`] over the `request`/
 //! `reply` admission channel; this client presents its capability chain there.
 
-use crate::proto::{AdmitReq, AdmitResp, Signal, SignalEnvelope, TOPIC_ADMIT, room_topic};
-use crate::room::{Effect, Room};
+use crate::order::SignalRouter;
+use crate::proto::{
+    AdmitReq, AdmitResp, ResumeToken, Signal, SignalEnvelope, TOPIC_ADMIT, room_topic,
+};
+use crate::room::{Effect, Room, RoomSnapshot};
 use anyhow::{Result, anyhow};
 use ce_rs::CeClient;
 use sha2::{Digest, Sha256};
@@ -35,6 +38,8 @@ pub fn now_secs() -> u64 {
 pub struct MeetClient {
     ce: CeClient,
     room: Room,
+    /// Per-peer reorder buffer for directed SDP/ICE signals (in-order, de-duplicated delivery).
+    router: SignalRouter,
 }
 
 impl MeetClient {
@@ -43,7 +48,14 @@ impl MeetClient {
     pub fn new(ce: CeClient, room_id: impl Into<String>, me: impl Into<String>) -> Self {
         let room_id = room_id.into();
         let me = me.into();
-        MeetClient { ce, room: Room::new(room_id, me) }
+        MeetClient { ce, room: Room::new(room_id, me), router: SignalRouter::new() }
+    }
+
+    /// Rebuild a client from a persisted [`RoomSnapshot`] (host or participant resuming after a
+    /// crash). The roster, member LWW state, and outbound `seq` are restored intact; the directed-
+    /// signal reorder buffer starts fresh (per-peer ordering re-anchors on the next directed signal).
+    pub fn restore(ce: CeClient, snapshot: RoomSnapshot) -> Self {
+        MeetClient { ce, room: Room::restore(snapshot), router: SignalRouter::new() }
     }
 
     /// The room id this client is bound to.
@@ -54,6 +66,25 @@ impl MeetClient {
     /// A read-only view of the local roster state.
     pub fn room(&self) -> &Room {
         &self.room
+    }
+
+    /// Capture the local roster state for persistence (see [`Room::snapshot`]).
+    pub fn snapshot(&self) -> RoomSnapshot {
+        self.room.snapshot()
+    }
+
+    /// Restore this client's outbound sequence floor on reconnect, so a resumed session never re-uses
+    /// a `seq` peers would drop. Pass the `seq_floor` from a [`ResumeToken`] (or a persisted
+    /// snapshot's `next_seq`). Returns the new outbound seq. See [`Room::resume_outbound_from`].
+    pub fn resume_outbound_from(&mut self, floor: u64) -> u64 {
+        self.room.resume_outbound_from(floor)
+    }
+
+    /// Adopt the `seq_floor` carried by a host's [`ResumeToken`] after a successful reconnect, so the
+    /// resumed session continues its monotonic outbound sequence. Convenience over
+    /// [`MeetClient::resume_outbound_from`].
+    pub fn adopt_resume(&mut self, tok: &ResumeToken) -> u64 {
+        self.room.resume_outbound_from(tok.seq_floor)
     }
 
     /// Subscribe to the room's pubsub topic so this node receives signaling envelopes. Idempotent.
@@ -138,6 +169,39 @@ impl MeetClient {
         }
     }
 
+    /// Apply one raw received message and, if it is a **directed signal addressed to us**, feed it
+    /// through the per-peer reorder buffer — returning the directed signals that are now deliverable
+    /// to our WebRTC stack **in the sender's `seq` order**, de-duplicated. Membership (join/leave/
+    /// keepalive) is still applied to the roster as a side effect (drop the returned [`Effect`] if you
+    /// only want the ordered signals). Directed signals not addressed to us, and malformed input,
+    /// yield an empty vec.
+    ///
+    /// This is the ordering guarantee the SDP/ICE flow needs: pubsub delivers unordered, but a browser
+    /// must apply an offer before its trickled candidates. Use this from the SSE message handler to
+    /// drive `RTCPeerConnection` deterministically.
+    pub fn ingest_ordered(&mut self, from: &str, payload: &[u8]) -> Vec<SignalEnvelope> {
+        let env = match SignalEnvelope::from_bytes(payload) {
+            Ok(e) => e.with_sender(from),
+            Err(_) => return Vec::new(),
+        };
+        match self.room.apply(&env) {
+            Effect::Directed(boxed) => {
+                if boxed.addressed_to(self.room.me()) {
+                    self.router.offer(*boxed)
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Skip a peer's directed-signal reorder buffer past a presumed-lost `seq` (e.g. an offer the
+    /// caller will renegotiate). Returns the now-deliverable run. See [`SignalRouter::skip_peer_to`].
+    pub fn skip_peer_to(&mut self, peer: &str, seq: u64) -> Vec<SignalEnvelope> {
+        self.router.skip_peer_to(peer, seq)
+    }
+
     /// Request admission to a **gated** room from its `host` (NodeId hex), presenting `caps_hex`.
     /// Uses the SDK `request`/`reply` transport on [`TOPIC_ADMIT`]. Returns the host's
     /// [`AdmitResp`] (including the ICE servers to configure). `timeout_ms` bounds the wait.
@@ -152,8 +216,38 @@ impl MeetClient {
             room_id: self.room.room_id().to_string(),
             caps: caps_hex.to_string(),
             display_name,
+            resume: None,
         };
-        let payload = serde_json::to_vec(&req)?;
+        self.send_admit(host, &req, timeout_ms).await
+    }
+
+    /// Reconnect to a gated room by presenting a prior [`ResumeToken`] instead of the full capability
+    /// chain. On success the host re-admits by identity (no chain re-check) and returns a fresh
+    /// token; the caller should [`MeetClient::adopt_resume`] it to keep its outbound `seq` monotonic.
+    pub async fn request_resume(
+        &self,
+        host: &str,
+        resume: ResumeToken,
+        display_name: Option<String>,
+        timeout_ms: u64,
+    ) -> Result<AdmitResp> {
+        let req = AdmitReq {
+            room_id: self.room.room_id().to_string(),
+            caps: String::new(),
+            display_name,
+            resume: Some(resume),
+        };
+        self.send_admit(host, &req, timeout_ms).await
+    }
+
+    /// Encode and send an [`AdmitReq`] to `host` over the admission request/reply channel.
+    async fn send_admit(
+        &self,
+        host: &str,
+        req: &AdmitReq,
+        timeout_ms: u64,
+    ) -> Result<AdmitResp> {
+        let payload = serde_json::to_vec(req)?;
         let reply = self.ce.request(host, TOPIC_ADMIT, &payload, timeout_ms).await?;
         serde_json::from_slice(&reply).map_err(|e| anyhow!("malformed admit reply: {e}"))
     }
@@ -213,5 +307,73 @@ mod tests {
             Some(Effect::Directed(e)) => assert_eq!(e.from, "peerA"),
             other => panic!("expected Directed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn restore_rebuilds_roster_and_outbound_seq() {
+        let ce = CeClient::with_token("http://127.0.0.1:8844", None);
+        let mut client = MeetClient::new(ce, "room", "me");
+        client.apply_message("peerA", &SignalEnvelope::broadcast("room", 0, 1, Signal::Join { display_name: None }).to_bytes());
+        client.room.next_outbound_seq(); // advance my own counter
+        let snap = client.snapshot();
+
+        let ce2 = CeClient::with_token("http://127.0.0.1:8844", None);
+        let restored = MeetClient::restore(ce2, snap);
+        assert_eq!(restored.room().present(), vec!["peerA"]);
+        assert_eq!(restored.room().outbound_seq(), client.room().outbound_seq());
+    }
+
+    #[test]
+    fn adopt_resume_advances_outbound_floor() {
+        let ce = CeClient::with_token("http://127.0.0.1:8844", None);
+        let mut client = MeetClient::new(ce, "room", "me");
+        let tok = ResumeToken {
+            room_id: "room".into(),
+            node_id: "me".into(),
+            expires_at: 9999,
+            seq_floor: 7,
+            mac: "x".into(),
+        };
+        assert_eq!(client.adopt_resume(&tok), 7);
+        assert_eq!(client.room().outbound_seq(), 7);
+    }
+
+    #[test]
+    fn ingest_ordered_delivers_directed_signals_in_seq_order() {
+        let ce = CeClient::with_token("http://127.0.0.1:8844", None);
+        let mut client = MeetClient::new(ce, "room", "me");
+        // offer(seq0), then ice(seq2) arrives before ice(seq1) -> buffered, released in order
+        let offer = SignalEnvelope::directed("room", "me", 0, 1, Signal::Offer { sdp: "o".into() });
+        let ice2 = SignalEnvelope::directed("room", "me", 2, 3, Signal::IceCandidate {
+            candidate: "c2".into(), sdp_mid: None, sdp_m_line_index: None });
+        let ice1 = SignalEnvelope::directed("room", "me", 1, 2, Signal::IceCandidate {
+            candidate: "c1".into(), sdp_mid: None, sdp_m_line_index: None });
+
+        let r0 = client.ingest_ordered("peerA", &offer.to_bytes());
+        assert_eq!(r0.len(), 1);
+        assert_eq!(r0[0].seq, 0);
+        assert!(client.ingest_ordered("peerA", &ice2.to_bytes()).is_empty(), "gap buffers");
+        let run = client.ingest_ordered("peerA", &ice1.to_bytes());
+        assert_eq!(run.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn ingest_ordered_ignores_signals_for_other_peers() {
+        let ce = CeClient::with_token("http://127.0.0.1:8844", None);
+        let mut client = MeetClient::new(ce, "room", "me");
+        // directed at someone else -> not surfaced to us
+        let env = SignalEnvelope::directed("room", "OTHER", 0, 1, Signal::Offer { sdp: "x".into() });
+        assert!(client.ingest_ordered("peerA", &env.to_bytes()).is_empty());
+    }
+
+    #[test]
+    fn ingest_ordered_ignores_malformed_and_broadcast() {
+        let ce = CeClient::with_token("http://127.0.0.1:8844", None);
+        let mut client = MeetClient::new(ce, "room", "me");
+        assert!(client.ingest_ordered("peerA", b"not json").is_empty());
+        // a broadcast join still updates the roster but yields no directed signals
+        let join = SignalEnvelope::broadcast("room", 0, 1, Signal::Join { display_name: None });
+        assert!(client.ingest_ordered("peerA", &join.to_bytes()).is_empty());
+        assert_eq!(client.room().present(), vec!["peerA"]);
     }
 }

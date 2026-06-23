@@ -13,9 +13,15 @@
 //!   request/response and the opaque capability abilities.
 //! - [`room`] — the [`room::Room`] roster state machine: a per-member last-writer-wins register keyed
 //!   by NodeId and ordered by the sender's own monotonic `seq`, so membership **converges** under the
-//!   unordered, lossy, duplicating delivery that pubsub gives — order of arrival does not matter.
+//!   unordered, lossy, duplicating delivery that pubsub gives — order of arrival does not matter. Adds
+//!   [`room::RoomSnapshot`] for **persistent room state** (snapshot/restore/merge) and resume-by-
+//!   identity sequence recovery.
 //! - [`caps`] — capability resolution and the host-side [`caps::Gate`] that authorizes a signed
 //!   `ce-cap` chain before admitting a joiner to a gated room.
+//! - [`admit`] — the host-side [`admit::Admitter`]: the full gated-room admission flow over the gate,
+//!   plus participant **reconnection** via a MAC'd, identity-bound [`proto::ResumeToken`].
+//! - [`order`] — [`order::OrderedInbox`] / [`order::SignalRouter`]: per-peer reorder buffers giving
+//!   the in-order, de-duplicated SDP/ICE delivery a WebRTC negotiation needs (**ordering guarantees**).
 //! - [`client`] — [`client::MeetClient`], the participant-facing signaling client over [`ce_rs`].
 //! - [`turn`] — STUN/TURN config types and the documented **TURN-via-relay** (paid, channel-bound)
 //!   and SFU-cell plan for the media plane.
@@ -42,17 +48,21 @@
 //! # Ok(()) }
 //! ```
 
+pub mod admit;
 pub mod caps;
 pub mod client;
+pub mod order;
 pub mod proto;
 pub mod room;
 pub mod turn;
 
+pub use admit::Admitter;
 pub use caps::Gate;
 pub use client::{MeetClient, new_room_id, now_secs};
+pub use order::{OrderedInbox, SignalRouter};
 pub use proto::{
-    AdmitReq, AdmitResp, Signal, SignalEnvelope, ABILITY_HOST, ABILITY_JOIN, ABILITY_MODERATE,
-    room_topic,
+    AdmitReq, AdmitResp, ResumeToken, Signal, SignalEnvelope, ABILITY_HOST, ABILITY_JOIN,
+    ABILITY_MODERATE, room_topic,
 };
-pub use room::{Effect, Member, Room};
+pub use room::{Effect, Member, Room, RoomSnapshot};
 pub use turn::{IceServer, TurnCredential};

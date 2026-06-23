@@ -37,7 +37,25 @@ capability chains.
 - **Gating.** An open room admits anyone. A gated room's host runs a `Gate` that authorizes a
   presented `ce-cap` chain (rooted at the host's own key or a configured org root) against the opaque
   abilities `meet:join` / `meet:host` / `meet:moderate` before admitting a joiner — offline,
-  attenuating, revocation-aware.
+  attenuating, revocation-aware. The host-side **`Admitter`** wraps the gate into the full admission
+  flow: it answers an `AdmitReq` with an `AdmitResp` (allow/deny + ICE servers) and mints a
+  reconnect token on success.
+- **Persistent room state.** A host (or a participant resuming after a crash) can `snapshot()` the
+  convergent roster to a `RoomSnapshot` (serializable to disk/blob) and `restore()` it later, picking
+  up exactly where it left off without replaying signaling history. Two hosts that took divergent
+  slices of the stream reconcile with `merge_snapshot()` — an order-independent LWW merge — and a
+  `digest()` lets any replica cheaply assert convergence.
+- **Reconnection (resume by identity).** On first admission the host issues a `ResumeToken` keyed to
+  the joiner's NodeId and MAC'd with the host's secret. On a later reconnect the participant presents
+  the token instead of re-running the capability handshake; the host re-derives and re-checks it
+  against the **authenticated** reconnecting NodeId, so a stolen token used by another node is
+  rejected and an expired one forces a fresh handshake. The token carries the participant's `seq`
+  floor so the resumed session never re-uses a sequence number a peer would silently drop.
+- **SDP/ICE ordering guarantees.** Pubsub delivers unordered, but a browser must apply an SDP offer
+  before its trickled ICE candidates. The per-peer **`OrderedInbox`** (multiplexed by `SignalRouter`)
+  reorders each sender's directed signals by `seq` into strictly ascending, de-duplicated delivery,
+  with a bounded window so a permanently lost message never wedges the stream (`skip_to` steps past a
+  hole). `MeetClient::ingest_ordered` drives a WebRTC stack deterministically from the message stream.
 
 ## Library
 
@@ -65,7 +83,9 @@ for effect in client.poll().await? {
 # Ok(()) }
 ```
 
-Modules: `proto` (wire format), `room` (roster CRDT), `caps` (resolution + host `Gate`),
+Modules: `proto` (wire format + admission/resume messages), `room` (roster CRDT +
+snapshot/restore/merge persistence), `caps` (resolution + host `Gate`), `admit` (host-side
+`Admitter`: gate + resume-by-identity), `order` (`OrderedInbox`/`SignalRouter` SDP/ICE reordering),
 `client` (`MeetClient`), `turn` (STUN/TURN config + the relay/SFU plan).
 
 ## CLI
@@ -79,6 +99,12 @@ ce-meet create-room --gated
 ce-meet join <room-id> --name "Leif"
 # Gated room: request admission from the host with a capability chain.
 ce-meet join <room-id> --host <host-node-id> --caps <chain-hex>
+
+# Host a gated room: serve admission requests, authorizing each joiner's capability chain
+# (and honoring resume tokens on reconnect). --open admits anyone; --root adds accepted org roots.
+ce-meet host <room-id>
+ce-meet host <room-id> --open
+ce-meet host <room-id> --root <org-node-id>
 
 # Publish one directed signal (the browser drives the actual WebRTC session).
 ce-meet signal <room-id> <peer-node-id> offer  "v=0..."
@@ -111,9 +137,13 @@ in an admission reply. Three tiers, cheapest first (see `src/turn.rs` for the fu
 ## Tests
 
 `cargo test` — unit tests on every public fn (happy + error paths), integration tests (full
-SDP/ICE round-trips, two-replica roster convergence, the capability gate end-to-end, dropped-peer
-pruning, duplicate/reordered delivery), and property tests (envelope serialization round-trips, CRDT
-convergence under arbitrary order + duplicates, LWW correctness, TURN credential soundness,
+SDP/ICE round-trips and in-order reorder-buffer delivery, two-replica roster convergence,
+persisted-host snapshot/restore convergence under concurrent updates, two-replica snapshot merge
+reconciliation, reconnection-resume by identity + stolen/expired-token rejection, the capability
+gate and `Admitter` deny/allow end-to-end, dropped-peer pruning, duplicate/reordered delivery), and
+property tests (envelope serialization round-trips, CRDT convergence under arbitrary order +
+duplicates, snapshot-restore and snapshot-merge convergence, in-order reorder-buffer delivery under
+any permutation + monotonic output, LWW correctness, TURN credential soundness,
 parser-never-panics on arbitrary bytes).
 
 ## License

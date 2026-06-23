@@ -16,10 +16,11 @@
 //! is commutative, idempotent, and convergent — the properties the tests assert.
 
 use crate::proto::{Signal, SignalEnvelope};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// One member's presence in the local roster view.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
     /// The member's authenticated NodeId (hex).
     pub node_id: String,
@@ -233,6 +234,139 @@ impl Room {
         pruned.sort();
         pruned
     }
+
+    // ---- Persistent room state -------------------------------------------------------------
+
+    /// Capture the full convergent state of this room as a [`RoomSnapshot`] — the room id, every
+    /// member's LWW register (`last_seq`/presence/`last_seen`/name) and this participant's own
+    /// outbound `next_seq`. A host (or a participant resuming after a crash) persists this and later
+    /// restores it with [`Room::restore`], picking up exactly where it left off without replaying the
+    /// whole signaling history. Because the state is a per-member LWW set, a restored snapshot that is
+    /// then fed newer envelopes converges to the same membership as one that never crashed.
+    pub fn snapshot(&self) -> RoomSnapshot {
+        let mut members: Vec<Member> = self.members.values().cloned().collect();
+        members.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        RoomSnapshot {
+            room_id: self.room_id.clone(),
+            me: self.me.clone(),
+            next_seq: self.next_seq,
+            members,
+        }
+    }
+
+    /// Rebuild a [`Room`] from a persisted [`RoomSnapshot`]. The inverse of [`Room::snapshot`].
+    pub fn restore(snap: RoomSnapshot) -> Self {
+        let members =
+            snap.members.into_iter().map(|m| (m.node_id.clone(), m)).collect::<HashMap<_, _>>();
+        Room { room_id: snap.room_id, me: snap.me, members, next_seq: snap.next_seq }
+    }
+
+    /// A deterministic, order-independent digest of the convergent roster state: for every member,
+    /// `(node_id, present, last_seq)` sorted by node id. Two replicas that have applied the same set
+    /// of envelopes (in any order, with any duplicates) produce the **same** digest — so a host can
+    /// cheaply assert convergence, or a reconnecting peer can detect it is behind. Display names and
+    /// `last_seen` are intentionally excluded: they are cosmetic/liveness, not membership identity.
+    pub fn digest(&self) -> Vec<(String, bool, u64)> {
+        let mut d: Vec<(String, bool, u64)> =
+            self.members.values().map(|m| (m.node_id.clone(), m.present, m.last_seq)).collect();
+        d.sort();
+        d
+    }
+
+    /// Merge another replica's [`RoomSnapshot`] of the **same** room into this one, applying the LWW
+    /// rule per member: a higher `last_seq` wins; on an equal `last_seq` a conflicting presence
+    /// resolves absent-wins (the same remove-bias tie-break [`Room::apply`] uses), so the merge is
+    /// commutative and convergent. Snapshots for a different room are ignored. Returns the node ids
+    /// whose presence changed locally. This is how a host that took over a room (or two hosts that
+    /// reconcile) converge their persisted state without replaying every envelope.
+    pub fn merge_snapshot(&mut self, other: &RoomSnapshot) -> Vec<String> {
+        if other.room_id != self.room_id {
+            return Vec::new();
+        }
+        let mut changed = Vec::new();
+        for om in &other.members {
+            match self.members.get_mut(&om.node_id) {
+                Some(m) => {
+                    if om.last_seq > m.last_seq {
+                        if m.present != om.present {
+                            changed.push(m.node_id.clone());
+                        }
+                        m.last_seq = om.last_seq;
+                        m.present = om.present;
+                        m.last_seen = om.last_seen.max(m.last_seen);
+                        if om.display_name.is_some() {
+                            m.display_name = om.display_name.clone();
+                        }
+                    } else if om.last_seq == m.last_seq {
+                        // Equal seq: absent wins; refresh last_seen/name opportunistically.
+                        m.last_seen = om.last_seen.max(m.last_seen);
+                        if om.display_name.is_some() && m.display_name.is_none() {
+                            m.display_name = om.display_name.clone();
+                        }
+                        if !om.present && m.present {
+                            m.present = false;
+                            changed.push(m.node_id.clone());
+                        }
+                    }
+                    // strictly older: ignore.
+                }
+                None => {
+                    if om.present {
+                        changed.push(om.node_id.clone());
+                    }
+                    self.members.insert(om.node_id.clone(), om.clone());
+                }
+            }
+        }
+        changed.sort();
+        changed
+    }
+
+    // ---- Participant reconnection (resume by identity) -------------------------------------
+
+    /// Restore this participant's outbound sequence floor after a reconnection, so a resumed session
+    /// never re-uses a `seq` it already published (which a peer's LWW register would silently drop as
+    /// a duplicate/reorder). Pass the highest `seq` the participant is known to have sent — typically
+    /// from a persisted [`RoomSnapshot::next_seq`] or a [`crate::client::ResumeToken`]. The outbound
+    /// counter advances to `max(current, floor)`; it never goes backwards. Returns the new next seq.
+    pub fn resume_outbound_from(&mut self, floor: u64) -> u64 {
+        self.next_seq = self.next_seq.max(floor);
+        self.next_seq
+    }
+
+    /// The current outbound sequence counter (the value the *next* [`Room::next_outbound_seq`] call
+    /// will return). Persist this in a resume token so a reconnecting participant keeps monotonicity.
+    pub fn outbound_seq(&self) -> u64 {
+        self.next_seq
+    }
+}
+
+/// A persisted, restorable snapshot of a [`Room`]'s convergent state. Serializable so a host can
+/// write it to disk (or a blob) and reload it, and so two replicas can reconcile via
+/// [`Room::merge_snapshot`]. See [`Room::snapshot`] / [`Room::restore`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomSnapshot {
+    /// The room this snapshot belongs to.
+    pub room_id: String,
+    /// The participant whose local view this is.
+    pub me: String,
+    /// The participant's own next outbound sequence number (monotonic; preserved across restore).
+    pub next_seq: u64,
+    /// Every member's LWW register, sorted by node id for a deterministic encoding.
+    pub members: Vec<Member>,
+}
+
+impl RoomSnapshot {
+    /// Serialize to JSON bytes for persistence (disk, blob store, or a resume payload).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_else(|_| b"{}".to_vec())
+    }
+
+    /// Parse a snapshot from JSON bytes. Rejects malformed input with a descriptive error.
+    pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        serde_json::from_slice(bytes)
+            .map_err(|e| anyhow::anyhow!("malformed ce-meet room snapshot: {e}"))
+    }
 }
 
 #[cfg(test)]
@@ -351,5 +485,154 @@ mod tests {
         // A later (lower seq) join is ignored; convergence holds.
         assert_eq!(room.apply(&join("a", 1, 5)), Effect::NoChange);
         assert!(room.present().is_empty());
+    }
+
+    // ---- persistent room state ----
+
+    #[test]
+    fn snapshot_restore_round_trip_preserves_state() {
+        let mut room = Room::new("r", "me");
+        room.apply(&join("a", 0, 10));
+        room.apply(&join("b", 0, 11));
+        room.apply(&leave("b", 1, 12));
+        room.next_outbound_seq(); // bump my own counter to 1
+        let snap = room.snapshot();
+        let restored = Room::restore(snap.clone());
+        assert_eq!(restored.present(), room.present());
+        assert_eq!(restored.outbound_seq(), room.outbound_seq());
+        assert_eq!(restored.snapshot(), snap);
+    }
+
+    #[test]
+    fn snapshot_bytes_round_trip() {
+        let mut room = Room::new("r", "me");
+        room.apply(&join("a", 2, 10));
+        let snap = room.snapshot();
+        let bytes = snap.to_bytes();
+        let back = RoomSnapshot::from_bytes(&bytes).unwrap();
+        assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn snapshot_from_bytes_rejects_garbage() {
+        assert!(RoomSnapshot::from_bytes(b"not json").is_err());
+        assert!(RoomSnapshot::from_bytes(b"{}").is_err());
+    }
+
+    #[test]
+    fn restored_room_converges_with_later_events() {
+        // A host snapshots, "crashes", restores, then applies a newer event: it must end in the same
+        // state as a host that never crashed and saw every event.
+        let mut live = Room::new("r", "me");
+        live.apply(&join("a", 0, 10));
+        let snap = live.snapshot();
+
+        let mut crashed = Room::restore(snap);
+        // newer event arrives only at the restored replica
+        crashed.apply(&leave("a", 1, 20));
+        // the live one also sees it
+        live.apply(&leave("a", 1, 20));
+
+        assert_eq!(crashed.present(), live.present());
+        assert_eq!(crashed.digest(), live.digest());
+    }
+
+    #[test]
+    fn digest_is_order_independent() {
+        let mut r1 = Room::new("r", "me");
+        let mut r2 = Room::new("r", "me");
+        r1.apply(&join("a", 0, 10));
+        r1.apply(&join("b", 0, 11));
+        r1.apply(&leave("a", 1, 12));
+        // r2 sees the same events reversed, with a duplicate
+        r2.apply(&leave("a", 1, 12));
+        r2.apply(&join("b", 0, 11));
+        r2.apply(&join("a", 0, 10));
+        r2.apply(&join("b", 0, 11));
+        assert_eq!(r1.digest(), r2.digest());
+    }
+
+    #[test]
+    fn merge_snapshot_converges_two_replicas() {
+        // Replica 1 saw a-join; replica 2 saw b-join and a-leave(seq1). Merging 2 into 1 must yield
+        // the union LWW state: a absent (seq 1 wins), b present.
+        let mut r1 = Room::new("r", "me");
+        r1.apply(&join("a", 0, 10));
+
+        let mut r2 = Room::new("r", "me");
+        r2.apply(&join("b", 0, 11));
+        r2.apply(&leave("a", 1, 20)); // r2 only ever saw a's leave at seq 1
+
+        let changed = r1.merge_snapshot(&r2.snapshot());
+        // a flips present->absent, b is newly added present
+        assert!(changed.contains(&"b".to_string()));
+        assert!(changed.contains(&"a".to_string()));
+        assert_eq!(r1.present(), vec!["b"]);
+
+        // Merge is symmetric in outcome: merging r1 into r2 yields the same present-set.
+        let mut r1b = Room::new("r", "me");
+        r1b.apply(&join("a", 0, 10));
+        let mut r2b = Room::new("r", "me");
+        r2b.apply(&join("b", 0, 11));
+        r2b.apply(&leave("a", 1, 20));
+        r2b.merge_snapshot(&r1b.snapshot());
+        assert_eq!(r2b.present(), r1.present());
+    }
+
+    #[test]
+    fn merge_snapshot_ignores_other_room() {
+        let mut r1 = Room::new("r", "me");
+        r1.apply(&join("a", 0, 10));
+        let mut other = Room::new("OTHER", "me");
+        other.apply(&join("z", 0, 99));
+        let changed = r1.merge_snapshot(&other.snapshot());
+        assert!(changed.is_empty());
+        assert_eq!(r1.present(), vec!["a"]);
+    }
+
+    #[test]
+    fn merge_snapshot_older_seq_does_not_override() {
+        let mut r1 = Room::new("r", "me");
+        r1.apply(&join("a", 5, 10)); // a present at seq 5
+        let mut stale = Room::new("r", "me");
+        stale.apply(&leave("a", 2, 5)); // a absent at seq 2 (older)
+        let changed = r1.merge_snapshot(&stale.snapshot());
+        assert!(changed.is_empty(), "older snapshot must not flip newer state");
+        assert_eq!(r1.present(), vec!["a"]);
+    }
+
+    // ---- reconnection / resume ----
+
+    #[test]
+    fn resume_outbound_never_goes_backwards() {
+        let mut room = Room::new("r", "me");
+        room.next_outbound_seq(); // 0
+        room.next_outbound_seq(); // 1, next is 2
+        assert_eq!(room.outbound_seq(), 2);
+        // resuming from a lower floor keeps the higher counter
+        assert_eq!(room.resume_outbound_from(1), 2);
+        // resuming from a higher floor advances it
+        assert_eq!(room.resume_outbound_from(10), 10);
+        // and the next allocated seq respects the floor (no reuse)
+        assert_eq!(room.next_outbound_seq(), 10);
+    }
+
+    #[test]
+    fn resume_prevents_seq_reuse_so_peer_accepts_post_reconnect_messages() {
+        // A participant publishes join(seq0); a peer records it. The participant crashes, restores
+        // from a token carrying next_seq=1, and publishes leave. Without resume it would reuse seq0
+        // and the peer would drop the leave as a duplicate; with resume the leave gets seq1 and wins.
+        let mut peer_view = Room::new("r", "peer");
+        peer_view.apply(&join("p", 0, 10));
+        assert_eq!(peer_view.present(), vec!["p"]);
+
+        let mut resumed = Room::new("r", "p");
+        resumed.resume_outbound_from(1); // token said we already used seq 0
+        let next = resumed.next_outbound_seq();
+        assert_eq!(next, 1);
+        let leave_env =
+            SignalEnvelope::broadcast("r", next, 20, Signal::Leave).with_sender("p");
+        assert_eq!(peer_view.apply(&leave_env), Effect::Left("p".into()));
+        assert!(peer_view.present().is_empty());
     }
 }

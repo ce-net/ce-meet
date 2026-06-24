@@ -9,11 +9,14 @@
 
 use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
 use ce_identity::Identity;
-use ce_meet::admit::Admitter;
+use ce_meet::admit::{AdmitRateLimiter, Admitter};
 use ce_meet::caps::Gate;
 use ce_meet::order::{OrderedInbox, SignalRouter};
-use ce_meet::proto::{ABILITY_JOIN, AdmitReq, Signal, SignalEnvelope};
+use ce_meet::proto::{
+    ABILITY_HOST, ABILITY_JOIN, ABILITY_MODERATE, AdmitReq, MAX_SDP_LEN, Signal, SignalEnvelope,
+};
 use ce_meet::room::{Effect, Room};
+use ce_meet::turn::{RelayCandidate, select_relay};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 fn id(tag: &str) -> Identity {
@@ -27,7 +30,7 @@ fn id(tag: &str) -> Identity {
 /// Deliver an envelope (as it would arrive off pubsub) to a replica: serialize, "transport",
 /// deserialize, stamp the authenticated sender, apply.
 fn deliver(room: &mut Room, from: &str, env: &SignalEnvelope) -> Effect {
-    let bytes = env.to_bytes();
+    let bytes = env.to_bytes().unwrap();
     let received = SignalEnvelope::from_bytes(&bytes).unwrap().with_sender(from);
     room.apply(&received)
 }
@@ -260,7 +263,7 @@ fn persisted_host_converges_with_live_host_across_concurrent_updates() {
         deliver(&mut crashing, ev.0, &to_env(ev));
     }
     let snap = crashing.snapshot();
-    let bytes = snap.to_bytes(); // round-trip through persistence
+    let bytes = snap.to_bytes().unwrap(); // round-trip through persistence
     let restored_snap = ce_meet::room::RoomSnapshot::from_bytes(&bytes).unwrap();
     let mut restored = Room::restore(restored_snap);
     // apply remaining events reversed + a duplicate
@@ -466,4 +469,161 @@ fn router_orders_each_peer_independently() {
     assert_eq!(got_a, vec![0, 1]);
     assert_eq!(got_b, vec![0, 1, 2]);
     assert_eq!(router.peer_count(), 2);
+}
+
+// ---- in-call media-control state converges like presence ----
+
+#[test]
+fn media_state_converges_across_replicas_under_reorder() {
+    // Two replicas observe a member's join + a sequence of media toggles in different orders; the
+    // member's final media state must match (LWW by the member's own seq).
+    let toggles = [
+        (0u64, Signal::Join { display_name: None }),
+        (1, Signal::Media { audio_muted: true, video_muted: false }),
+        (2, Signal::ScreenShare { active: true }),
+        (3, Signal::Media { audio_muted: false, video_muted: true }),
+        (4, Signal::RaiseHand { raised: true }),
+    ];
+
+    let mut v1 = Room::new("call", "v1");
+    for (seq, sig) in toggles.iter() {
+        deliver(&mut v1, "m", &SignalEnvelope::broadcast("call", *seq, *seq, sig.clone()));
+    }
+
+    // v2 sees them shuffled + a duplicate
+    let mut v2 = Room::new("call", "v2");
+    let order = [4usize, 1, 0, 3, 2, 1];
+    for i in order {
+        let (seq, sig) = &toggles[i];
+        deliver(&mut v2, "m", &SignalEnvelope::broadcast("call", *seq, *seq, sig.clone()));
+    }
+
+    let m1 = v1.member("m").unwrap();
+    let m2 = v2.member("m").unwrap();
+    assert_eq!((m1.audio_muted, m1.video_muted, m1.sharing, m1.hand_raised),
+               (false, true, true, true));
+    assert_eq!((m1.audio_muted, m1.video_muted, m1.sharing, m1.hand_raised),
+               (m2.audio_muted, m2.video_muted, m2.sharing, m2.hand_raised),
+               "media state converges regardless of order");
+}
+
+// ---- moderation actions are routed but authorized by the host gate ----
+
+#[test]
+fn kick_is_directed_and_does_not_touch_roster() {
+    let mut victim = Room::new("r", "victim");
+    let kick = SignalEnvelope::directed("r", "victim", 0, 10, Signal::Kick { reason: Some("bye".into()) });
+    match deliver(&mut victim, "host", &kick) {
+        Effect::Directed(e) => {
+            assert!(e.addressed_to("victim"));
+            assert_eq!(e.signal.tag(), "kick");
+        }
+        other => panic!("expected directed kick, got {other:?}"),
+    }
+    assert_eq!(victim.present_count(), 0);
+}
+
+#[test]
+fn end_room_marks_room_ended_for_all() {
+    let mut r = Room::new("r", "p");
+    r.apply(&SignalEnvelope::broadcast("r", 0, 10, Signal::Join { display_name: None }).with_sender("host"));
+    let end = SignalEnvelope::broadcast("r", 1, 11, Signal::EndRoom { reason: None }).with_sender("host");
+    match r.apply(&end) {
+        Effect::RoomEnded { by, .. } => assert_eq!(by, "host"),
+        other => panic!("expected RoomEnded, got {other:?}"),
+    }
+    assert!(r.is_ended());
+}
+
+#[test]
+fn moderate_ability_gates_kick_authorization() {
+    // A moderator with meet:moderate is authorized for a kick; a stranger is not. (The room machine
+    // routes the signal; the host gate is what decides whether to honor it.)
+    let host = id("host");
+    let mod_user = id("mod");
+    let stranger = id("stranger");
+    let cap = SignedCapability::issue(
+        &host,
+        mod_user.node_id(),
+        vec![ABILITY_MODERATE.to_string()],
+        Resource::Any,
+        Caveats::default(),
+        1,
+        None,
+    );
+    let chain = encode_chain(&[cap]);
+    let gate = Gate::gated(host.node_id(), vec![]);
+    assert!(gate.check(&mod_user.node_id_hex(), ABILITY_MODERATE, &chain, &[], 1000).is_ok());
+    assert!(gate.check(&stranger.node_id_hex(), ABILITY_MODERATE, "", &[], 1000).is_err());
+    // host ability is separate from moderate
+    assert!(gate.check(&mod_user.node_id_hex(), ABILITY_HOST, &chain, &[], 1000).is_err());
+}
+
+// ---- DoS guards ----
+
+#[test]
+fn roster_member_cap_resists_a_flood_of_distinct_senders() {
+    // Simulate a flood: many forged-looking NodeIds publish joins. The roster must not grow past the
+    // cap, bounding memory.
+    let mut room = Room::new("r", "me").with_max_members(50);
+    for i in 0..500u32 {
+        let from = format!("flood-{i}");
+        deliver(&mut room, &from, &SignalEnvelope::broadcast("r", 0, 10, Signal::Join { display_name: None }));
+    }
+    assert_eq!(room.known_count(), 50, "member cap bounds the roster under a sender flood");
+    assert!(room.present_count() <= 50);
+}
+
+#[test]
+fn oversized_sdp_is_rejected_at_parse_and_never_reaches_roster() {
+    let room = Room::new("r", "me");
+    let env = SignalEnvelope::directed("r", "me", 0, 10, Signal::Offer { sdp: "x".repeat(MAX_SDP_LEN + 1) });
+    // The frame is built locally but a receiver parses with from_bytes, which rejects it.
+    let bytes = env.to_bytes().unwrap();
+    assert!(SignalEnvelope::from_bytes(&bytes).is_err(), "oversized SDP rejected on receive");
+    // The roster is untouched.
+    assert_eq!(room.present_count(), 0);
+}
+
+#[test]
+fn admit_flood_is_rate_limited_before_verification() {
+    // An attacker floods admit requests from one identity; only `capacity` per window get through to
+    // the (expensive) gate, the rest are dropped cheaply.
+    let host = id("host");
+    let attacker = id("attacker");
+    let adm = Admitter::new("r", Gate::gated(host.node_id(), vec![]), b"s".to_vec());
+    let mut limiter = AdmitRateLimiter::new(5, 10, 1024);
+    let req = AdmitReq { room_id: "r".into(), caps: String::new(), display_name: None, resume: None };
+
+    let mut verified = 0;
+    let mut dropped = 0;
+    for _ in 0..100 {
+        if limiter.check(&attacker.node_id_hex(), 1000) {
+            // would run the gate
+            let _ = adm.admit(&attacker.node_id_hex(), &req, &[], 1000);
+            verified += 1;
+        } else {
+            dropped += 1;
+        }
+    }
+    assert_eq!(verified, 5, "only capacity requests reach verification per window");
+    assert_eq!(dropped, 95);
+}
+
+// ---- relay selection (media tier) ----
+
+#[test]
+fn relay_selection_prefers_nearest_then_most_reputable() {
+    let mut far = RelayCandidate::new("aa".repeat(32), "turn:far:3478");
+    far.rtt_ms = 200;
+    far.reputation = 1.0;
+    let mut near = RelayCandidate::new("bb".repeat(32), "turn:near:3478");
+    near.rtt_ms = 20;
+    near.reputation = 0.0;
+    let mut mid = RelayCandidate::new("cc".repeat(32), "turn:mid:3478");
+    mid.rtt_ms = 25;
+    mid.reputation = 1.0;
+    let ranked = select_relay(vec![far, near.clone(), mid]);
+    assert_eq!(ranked[0].node_id, near.node_id, "the closest relay is selected");
+    assert_eq!(ranked.len(), 3);
 }

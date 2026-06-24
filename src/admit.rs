@@ -24,7 +24,10 @@
 use crate::caps::Gate;
 use crate::proto::{ABILITY_JOIN, AdmitReq, AdmitResp, ResumeToken};
 use crate::turn::IceServer;
-use sha2::{Digest, Sha256};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Default lifetime of a minted [`ResumeToken`], in seconds (one hour). A reconnect within this
 /// window skips the capability handshake; after it, the participant re-authorizes.
@@ -168,21 +171,99 @@ impl Admitter {
         Ok(())
     }
 
-    /// Derive the token MAC: `hex(sha256(secret || room || 0 || node || 0 || expiry || 0 || floor))`.
-    /// Domain-separated by the room id and unambiguous field boundaries (NUL separators) so distinct
-    /// fields can never collide into the same preimage.
+    /// Derive the token MAC as `hex(HMAC-SHA256(secret, domain || room || 0 || node || 0 || expiry ||
+    /// floor))`. A real keyed MAC (not a hand-rolled `sha256(secret||...)`), so it is not vulnerable to
+    /// length-extension regardless of field layout. Domain-separated by a version tag and the room id,
+    /// with NUL separators between the variable-length string fields so distinct `(room, node)` pairs
+    /// can never collide into the same preimage.
     fn resume_mac(&self, node_id: &str, expires_at: u64, seq_floor: u64) -> String {
-        let mut h = Sha256::new();
-        h.update(b"ce-meet:resume:v1");
-        h.update(&self.mac_secret);
-        h.update([0u8]);
-        h.update(self.room_id.as_bytes());
-        h.update([0u8]);
-        h.update(node_id.as_bytes());
-        h.update([0u8]);
-        h.update(expires_at.to_le_bytes());
-        h.update(seq_floor.to_le_bytes());
-        hex::encode(h.finalize())
+        // `new_from_slice` accepts a key of any length (HMAC pads/hashes as needed); it is infallible
+        // for `Hmac`, but handle the Result without unwrap to honor the no-unwrap rule on prod paths.
+        let mut mac = match HmacSha256::new_from_slice(&self.mac_secret) {
+            Ok(m) => m,
+            Err(_) => return String::new(), // impossible for HMAC; an empty MAC never verifies.
+        };
+        mac.update(b"ce-meet:resume:v1");
+        mac.update(self.room_id.as_bytes());
+        mac.update(&[0u8]);
+        mac.update(node_id.as_bytes());
+        mac.update(&[0u8]);
+        mac.update(&expires_at.to_le_bytes());
+        mac.update(&seq_floor.to_le_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+}
+
+/// A per-sender admission-request rate limiter (a fixed-window token bucket) that bounds how much
+/// host CPU a flood of `meet:admit` requests can burn on full `ce-cap` signature verification.
+///
+/// Each distinct requester NodeId gets `capacity` admit attempts per `window_secs`; further attempts
+/// in the same window are dropped *before* the expensive gate runs. The bucket count is itself bounded
+/// (`max_tracked`) so the limiter cannot be turned into a memory-exhaustion vector by spoofed senders:
+/// once full, an unseen sender is rate-limited by default until a window rolls over and stale buckets
+/// are evicted. Cheap, allocation-light, and fully deterministic for testing (the clock is injected).
+#[derive(Debug, Clone)]
+pub struct AdmitRateLimiter {
+    capacity: u32,
+    window_secs: u64,
+    max_tracked: usize,
+    buckets: std::collections::HashMap<String, (u64, u32)>, // node -> (window_start, count)
+}
+
+/// Default admit attempts allowed per sender per window.
+pub const DEFAULT_ADMIT_CAPACITY: u32 = 10;
+/// Default rate-limit window, seconds.
+pub const DEFAULT_ADMIT_WINDOW_SECS: u64 = 10;
+/// Default cap on the number of distinct senders tracked at once (memory bound).
+pub const DEFAULT_ADMIT_MAX_TRACKED: usize = 4096;
+
+impl Default for AdmitRateLimiter {
+    fn default() -> Self {
+        Self::new(DEFAULT_ADMIT_CAPACITY, DEFAULT_ADMIT_WINDOW_SECS, DEFAULT_ADMIT_MAX_TRACKED)
+    }
+}
+
+impl AdmitRateLimiter {
+    /// Build a limiter allowing `capacity` attempts per `window_secs` per sender, tracking at most
+    /// `max_tracked` distinct senders. Zero values are clamped to 1 so it never divides by zero or
+    /// degenerates into an unbounded map.
+    pub fn new(capacity: u32, window_secs: u64, max_tracked: usize) -> Self {
+        AdmitRateLimiter {
+            capacity: capacity.max(1),
+            window_secs: window_secs.max(1),
+            max_tracked: max_tracked.max(1),
+            buckets: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record an attempt by `node` at `now` (unix seconds). Returns `true` if the attempt is allowed
+    /// (under the per-window cap) or `false` if it should be dropped. Rolls the window per sender and
+    /// evicts buckets older than one window when the tracked-sender cap is hit.
+    pub fn check(&mut self, node: &str, now: u64) -> bool {
+        // Roll/evict before inserting a brand-new sender so the map stays bounded.
+        if !self.buckets.contains_key(node) && self.buckets.len() >= self.max_tracked {
+            let window = self.window_secs;
+            self.buckets.retain(|_, (start, _)| now.saturating_sub(*start) < window);
+            if self.buckets.len() >= self.max_tracked {
+                // Still full of fresh buckets: refuse the unseen sender this window (fail-closed).
+                return false;
+            }
+        }
+        let window = self.window_secs;
+        let entry = self.buckets.entry(node.to_string()).or_insert((now, 0));
+        if now.saturating_sub(entry.0) >= window {
+            *entry = (now, 0); // new window
+        }
+        if entry.1 >= self.capacity {
+            return false;
+        }
+        entry.1 += 1;
+        true
+    }
+
+    /// Number of senders currently tracked (for tests/metrics).
+    pub fn tracked(&self) -> usize {
+        self.buckets.len()
     }
 }
 
@@ -371,5 +452,106 @@ mod tests {
         assert!(ct_eq(b"abc", b"abc"));
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn resume_mac_is_hmac_not_plain_sha256() {
+        // The MAC must equal HMAC-SHA256(secret, domain||room||0||node||0||expiry||floor),
+        // not a hand-rolled sha256(secret||...). Reproduce the HMAC and compare.
+        let adm = Admitter::new("room", Gate::open([0u8; 32]), b"k".to_vec());
+        let tok = adm.issue_resume("nodehex", 7, 1000);
+        let mut h = HmacSha256::new_from_slice(b"k").unwrap();
+        h.update(b"ce-meet:resume:v1");
+        h.update(b"room");
+        h.update(&[0u8]);
+        h.update(b"nodehex");
+        h.update(&[0u8]);
+        h.update(&tok.expires_at.to_le_bytes());
+        h.update(&7u64.to_le_bytes());
+        assert_eq!(tok.mac, hex::encode(h.finalize().into_bytes()));
+        // A plain sha256(secret||...) would differ.
+        use sha2::Digest;
+        let mut sh = Sha256::new();
+        sh.update(b"k");
+        sh.update(&tok.expires_at.to_le_bytes());
+        assert_ne!(tok.mac, hex::encode(sh.finalize()));
+    }
+
+    // ---- rate limiter ----
+
+    #[test]
+    fn rate_limiter_allows_up_to_capacity_then_blocks() {
+        let mut rl = AdmitRateLimiter::new(3, 10, 100);
+        assert!(rl.check("a", 1000));
+        assert!(rl.check("a", 1000));
+        assert!(rl.check("a", 1000));
+        // 4th in the same window is blocked
+        assert!(!rl.check("a", 1000));
+        // a different sender has its own budget
+        assert!(rl.check("b", 1000));
+    }
+
+    #[test]
+    fn rate_limiter_rolls_window() {
+        let mut rl = AdmitRateLimiter::new(2, 10, 100);
+        assert!(rl.check("a", 1000));
+        assert!(rl.check("a", 1005));
+        assert!(!rl.check("a", 1008)); // still in window [1000,1010)
+        // window rolls at 1010
+        assert!(rl.check("a", 1010));
+    }
+
+    #[test]
+    fn rate_limiter_bounds_tracked_senders() {
+        // Cap tracked senders at 2; a flood of distinct senders cannot grow the map without bound.
+        let mut rl = AdmitRateLimiter::new(5, 10, 2);
+        assert!(rl.check("a", 1000));
+        assert!(rl.check("b", 1000));
+        // 3rd distinct sender within the same window: map full of fresh buckets -> fail-closed.
+        assert!(!rl.check("c", 1000));
+        assert!(rl.tracked() <= 2);
+        // after the window, stale buckets evict and a new sender is admitted again.
+        assert!(rl.check("c", 1020));
+        assert!(rl.tracked() <= 2);
+    }
+
+    #[test]
+    fn rate_limiter_clamps_degenerate_params() {
+        let mut rl = AdmitRateLimiter::new(0, 0, 0);
+        // capacity clamped to 1: first allowed, second blocked within the (1s) window.
+        assert!(rl.check("a", 0));
+        assert!(!rl.check("a", 0));
+    }
+
+    #[test]
+    fn force_mute_chain_authorizes_via_moderate_ability() {
+        // A moderator holding meet:moderate is authorized by the host gate for a moderation action.
+        use crate::proto::ABILITY_MODERATE;
+        let host = id("host");
+        let mod_user = id("mod");
+        let cap = SignedCapability::issue(
+            &host,
+            mod_user.node_id(),
+            vec![ABILITY_MODERATE.to_string()],
+            Resource::Any,
+            Caveats::default(),
+            1,
+            None,
+        );
+        let chain = encode_chain(&[cap]);
+        let gate = Gate::gated(host.node_id(), vec![]);
+        assert!(gate.check(&mod_user.node_id_hex(), ABILITY_MODERATE, &chain, &[], 1000).is_ok());
+        // a join-only chain does NOT grant moderate
+        let join_cap = SignedCapability::issue(
+            &host,
+            mod_user.node_id(),
+            vec![ABILITY_JOIN.to_string()],
+            Resource::Any,
+            Caveats::default(),
+            2,
+            None,
+        );
+        let join_chain = encode_chain(&[join_cap]);
+        assert!(gate.check(&mod_user.node_id_hex(), ABILITY_MODERATE, &join_chain, &[], 1000).is_err());
     }
 }

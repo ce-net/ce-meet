@@ -41,8 +41,35 @@ pub const TOPIC_ADMIT: &str = "meet/admit";
 pub const ABILITY_JOIN: &str = "meet:join";
 /// Ability: host/own a room — admit and remove participants, end the room.
 pub const ABILITY_HOST: &str = "meet:host";
-/// Ability: moderate — remove (kick) a participant without owning the room.
+/// Ability: moderate — remove (kick) a participant or force-mute them without owning the room.
 pub const ABILITY_MODERATE: &str = "meet:moderate";
+
+// ---- Wire safety bounds (DoS hardening) ----------------------------------------------------
+//
+// Every length below caps an externally-supplied, attacker-controlled string so a peer cannot
+// publish a multi-megabyte blob and exhaust memory across the whole room. The numbers are generous
+// relative to real WebRTC traffic (a full SDP for a many-track call is a few kilobytes; a single ICE
+// candidate line is well under 256 bytes; a display name or chat line is a short human string) yet
+// small enough that the worst case is bounded. [`Signal::validate`] enforces them and
+// [`SignalEnvelope::from_bytes`] rejects an over-cap raw frame before it is even parsed.
+
+/// Maximum accepted size, in bytes, of a single serialized [`SignalEnvelope`] frame off the wire.
+/// A full multi-track SDP plus envelope overhead fits comfortably; anything larger is rejected.
+pub const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
+/// Maximum length of an SDP blob (offer/answer body).
+pub const MAX_SDP_LEN: usize = 32 * 1024;
+/// Maximum length of a single ICE candidate line.
+pub const MAX_CANDIDATE_LEN: usize = 1024;
+/// Maximum length of an `sdp_mid` media-stream identifier.
+pub const MAX_MID_LEN: usize = 256;
+/// Maximum length of a human display name.
+pub const MAX_NAME_LEN: usize = 128;
+/// Maximum length of an in-call chat message body.
+pub const MAX_CHAT_LEN: usize = 4 * 1024;
+/// Maximum length of a reaction token (an emoji or short symbolic name, e.g. `thumbsup`).
+pub const MAX_REACTION_LEN: usize = 64;
+/// Maximum length of a moderation/leave reason string.
+pub const MAX_REASON_LEN: usize = 512;
 
 /// The pubsub topic for a room. Deterministic from the room id; both the joiner and the host derive
 /// the same string, so no out-of-band topic exchange is needed.
@@ -87,12 +114,99 @@ pub enum Signal {
     },
     /// End-of-candidates marker for a media section (an empty trickle-ICE candidate). Directed.
     IceEnd,
+
+    // ---- In-call media-control signaling (broadcast; mirror Google Meet's per-tile state) ----
+    /// A participant's live audio/video mute state. Broadcast so every roster tile shows whether the
+    /// member is muted and whether their camera is on. The *state* is signaled here; the actual media
+    /// stop/start happens in the browser's WebRTC stack.
+    Media {
+        /// True when the microphone is muted (no audio sent).
+        audio_muted: bool,
+        /// True when the camera is off (no video sent).
+        video_muted: bool,
+    },
+    /// A participant started or stopped sharing their screen. Broadcast. Meet shows a "presenting"
+    /// badge; consumers light it up from this.
+    ScreenShare {
+        /// True when actively presenting a screen/window.
+        active: bool,
+    },
+    /// A participant raised or lowered their hand. Broadcast.
+    RaiseHand {
+        /// True = hand raised, false = lowered.
+        raised: bool,
+    },
+    /// A transient reaction (emoji/symbol) to flash on screen. Broadcast; not retained in the roster.
+    Reaction {
+        /// A short reaction token — an emoji or a symbolic name like `thumbsup`. Bounded length.
+        emoji: String,
+    },
+    /// An in-call text chat line. Broadcast to the whole room (Meet's chat panel). Not retained as
+    /// roster state; the caller appends it to its own transcript.
+    Chat {
+        /// The chat message body. Bounded length; never trusted as anything but display text.
+        body: String,
+    },
+
+    // ---- Recording-consent signaling (broadcast) ----
+    /// Someone began (or stopped) recording the call. Broadcast so every participant is informed and
+    /// can consent or leave — ce-meet performs no recording itself; this is the consent/notice signal.
+    Recording {
+        /// True = recording started, false = recording stopped.
+        active: bool,
+    },
+
+    // ---- Host/moderator control (directed at the affected participant; broadcast for EndRoom) ----
+    /// A host/moderator removes a participant from the room. Directed at the kicked NodeId. The
+    /// affected client leaves; other clients prune the member on the matching `Leave`/liveness. The
+    /// sender must hold [`ABILITY_HOST`] or [`ABILITY_MODERATE`] (enforced by the host's gate).
+    Kick {
+        /// Optional human-readable reason, surfaced to the removed participant. Bounded length.
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// A host/moderator force-mutes a participant's audio (the "mute everyone"/"mute participant"
+    /// control). Directed at the target NodeId, which should mute locally and broadcast its `Media`
+    /// state. Requires [`ABILITY_HOST`] or [`ABILITY_MODERATE`].
+    ForceMute {
+        /// True = force-mute audio, false = allow unmute (request the participant to unmute).
+        audio_muted: bool,
+    },
+    /// The host ends the room for everyone. Broadcast. Clients tear down and leave on receipt.
+    /// Requires [`ABILITY_HOST`].
+    EndRoom {
+        /// Optional reason shown to all participants. Bounded length.
+        #[serde(default)]
+        reason: Option<String>,
+    },
 }
 
 impl Signal {
-    /// Is this a room-wide broadcast (membership/liveness) rather than a directed peer message?
+    /// Is this a room-wide broadcast (membership/liveness/media-state/chat) rather than a directed
+    /// peer message? Directed signals carry a `to` recipient; broadcasts do not.
     pub fn is_broadcast(&self) -> bool {
-        matches!(self, Signal::Join { .. } | Signal::Leave | Signal::Keepalive)
+        matches!(
+            self,
+            Signal::Join { .. }
+                | Signal::Leave
+                | Signal::Keepalive
+                | Signal::Media { .. }
+                | Signal::ScreenShare { .. }
+                | Signal::RaiseHand { .. }
+                | Signal::Reaction { .. }
+                | Signal::Chat { .. }
+                | Signal::Recording { .. }
+                | Signal::EndRoom { .. }
+        )
+    }
+
+    /// Is this a host/moderator control action whose sender must be authorized (kick / force-mute /
+    /// end-room)? The host gate enforces the capability before the action is honored.
+    pub fn is_moderation(&self) -> bool {
+        matches!(
+            self,
+            Signal::Kick { .. } | Signal::ForceMute { .. } | Signal::EndRoom { .. }
+        )
     }
 
     /// A short tag for logging/metrics.
@@ -105,7 +219,61 @@ impl Signal {
             Signal::Answer { .. } => "answer",
             Signal::IceCandidate { .. } => "ice",
             Signal::IceEnd => "ice_end",
+            Signal::Media { .. } => "media",
+            Signal::ScreenShare { .. } => "screenshare",
+            Signal::RaiseHand { .. } => "raisehand",
+            Signal::Reaction { .. } => "reaction",
+            Signal::Chat { .. } => "chat",
+            Signal::Recording { .. } => "recording",
+            Signal::Kick { .. } => "kick",
+            Signal::ForceMute { .. } => "forcemute",
+            Signal::EndRoom { .. } => "endroom",
         }
+    }
+
+    /// Validate that all attacker-controlled string fields are within their wire bounds (see the
+    /// `MAX_*` constants). Returns `Ok(())` for a well-formed signal, `Err(reason)` (safe to log)
+    /// when any field exceeds its cap. Called on every received signal before it touches room state,
+    /// so an oversized blob can never be forwarded to a WebRTC stack or retained in a roster.
+    pub fn validate(&self) -> Result<(), String> {
+        fn check(field: &str, s: &str, max: usize) -> Result<(), String> {
+            if s.len() > max {
+                Err(format!("{field} exceeds {max} bytes ({} bytes)", s.len()))
+            } else {
+                Ok(())
+            }
+        }
+        match self {
+            Signal::Join { display_name } => {
+                if let Some(n) = display_name {
+                    check("display_name", n, MAX_NAME_LEN)?;
+                }
+            }
+            Signal::Offer { sdp } | Signal::Answer { sdp } => check("sdp", sdp, MAX_SDP_LEN)?,
+            Signal::IceCandidate { candidate, sdp_mid, .. } => {
+                check("candidate", candidate, MAX_CANDIDATE_LEN)?;
+                if let Some(m) = sdp_mid {
+                    check("sdp_mid", m, MAX_MID_LEN)?;
+                }
+            }
+            Signal::Reaction { emoji } => check("reaction", emoji, MAX_REACTION_LEN)?,
+            Signal::Chat { body } => check("chat", body, MAX_CHAT_LEN)?,
+            Signal::Kick { reason } | Signal::EndRoom { reason } => {
+                if let Some(r) = reason {
+                    check("reason", r, MAX_REASON_LEN)?;
+                }
+            }
+            // Variants with no unbounded string fields are always valid.
+            Signal::Leave
+            | Signal::Keepalive
+            | Signal::IceEnd
+            | Signal::Media { .. }
+            | Signal::ScreenShare { .. }
+            | Signal::RaiseHand { .. }
+            | Signal::Recording { .. }
+            | Signal::ForceMute { .. } => {}
+        }
+        Ok(())
     }
 }
 
@@ -157,17 +325,47 @@ impl SignalEnvelope {
         }
     }
 
-    /// Serialize to JSON bytes for the pubsub transport.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        // Infallible for these plain types; fall back to an empty object on the impossible error.
-        serde_json::to_vec(self).unwrap_or_else(|_| b"{}".to_vec())
+    /// Serialize to JSON bytes for the pubsub transport. Infallible in practice for these plain
+    /// `Serialize` types, but the error is surfaced rather than masked so a future non-trivial field
+    /// that breaks serialization is caught instead of silently emitting an empty frame.
+    pub fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(|e| anyhow::anyhow!("serialize ce-meet envelope: {e}"))
     }
 
-    /// Parse an envelope from JSON bytes received off a room topic. Rejects malformed input with a
-    /// descriptive error (never panics).
+    /// Parse an envelope from JSON bytes received off a room topic and validate its bounds. Rejects:
+    /// a frame larger than [`MAX_ENVELOPE_BYTES`] (before parsing, so a giant blob is cheap to drop),
+    /// malformed JSON, and any signal whose fields exceed their `MAX_*` caps. Never panics.
     pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
-        serde_json::from_slice(bytes)
-            .map_err(|e| anyhow::anyhow!("malformed ce-meet signal envelope: {e}"))
+        if bytes.len() > MAX_ENVELOPE_BYTES {
+            anyhow::bail!(
+                "ce-meet envelope too large: {} bytes (max {MAX_ENVELOPE_BYTES})",
+                bytes.len()
+            );
+        }
+        let env: SignalEnvelope = serde_json::from_slice(bytes)
+            .map_err(|e| anyhow::anyhow!("malformed ce-meet signal envelope: {e}"))?;
+        env.signal
+            .validate()
+            .map_err(|reason| anyhow::anyhow!("invalid ce-meet signal: {reason}"))?;
+        Ok(env)
+    }
+
+    /// Is this envelope fresh enough to act on, given the receiver's clock `now` (unix seconds) and a
+    /// `max_age_secs` window? Returns true when `sent_at` is within `[now - max_age_secs, now +
+    /// CLOCK_SKEW_SLACK]`. A `max_age_secs` of 0 disables the check (always fresh). Stale directed
+    /// candidates (a far-future or long-past `sent_at`) are dropped by callers that enforce freshness;
+    /// see [`crate::client::MeetClient`]. This makes the `sent_at` field load-bearing rather than
+    /// merely documented.
+    pub fn is_fresh(&self, now: u64, max_age_secs: u64) -> bool {
+        if max_age_secs == 0 {
+            return true;
+        }
+        // Reject envelopes claiming to be from too far in the future (clock skew or forgery).
+        const CLOCK_SKEW_SLACK: u64 = 120;
+        if self.sent_at > now.saturating_add(CLOCK_SKEW_SLACK) {
+            return false;
+        }
+        now.saturating_sub(self.sent_at) <= max_age_secs
     }
 
     /// Return a copy with `from` stamped to the authenticated sender the transport reported.
@@ -295,7 +493,7 @@ mod tests {
                 sdp_m_line_index: Some(0),
             },
         );
-        let bytes = e.to_bytes();
+        let bytes = e.to_bytes().unwrap();
         let back = SignalEnvelope::from_bytes(&bytes).unwrap();
         assert_eq!(e, back);
     }
@@ -371,5 +569,146 @@ mod tests {
         assert!(!resp.admitted);
         assert!(resp.resume.is_none());
         assert!(resp.ice_servers.is_empty());
+    }
+
+    // ---- new media-control / moderation signals ----
+
+    #[test]
+    fn media_control_signals_classify_as_broadcast() {
+        assert!(Signal::Media { audio_muted: true, video_muted: false }.is_broadcast());
+        assert!(Signal::ScreenShare { active: true }.is_broadcast());
+        assert!(Signal::RaiseHand { raised: true }.is_broadcast());
+        assert!(Signal::Reaction { emoji: "👍".into() }.is_broadcast());
+        assert!(Signal::Chat { body: "hi".into() }.is_broadcast());
+        assert!(Signal::Recording { active: true }.is_broadcast());
+        assert!(Signal::EndRoom { reason: None }.is_broadcast());
+    }
+
+    #[test]
+    fn directed_moderation_signals_are_not_broadcast() {
+        assert!(!Signal::Kick { reason: None }.is_broadcast());
+        assert!(!Signal::ForceMute { audio_muted: true }.is_broadcast());
+    }
+
+    #[test]
+    fn moderation_classification() {
+        assert!(Signal::Kick { reason: None }.is_moderation());
+        assert!(Signal::ForceMute { audio_muted: true }.is_moderation());
+        assert!(Signal::EndRoom { reason: None }.is_moderation());
+        assert!(!Signal::Chat { body: "x".into() }.is_moderation());
+        assert!(!Signal::Media { audio_muted: false, video_muted: false }.is_moderation());
+    }
+
+    #[test]
+    fn new_signal_tags_are_stable() {
+        assert_eq!(Signal::Media { audio_muted: true, video_muted: true }.tag(), "media");
+        assert_eq!(Signal::ScreenShare { active: false }.tag(), "screenshare");
+        assert_eq!(Signal::RaiseHand { raised: false }.tag(), "raisehand");
+        assert_eq!(Signal::Reaction { emoji: "x".into() }.tag(), "reaction");
+        assert_eq!(Signal::Chat { body: "x".into() }.tag(), "chat");
+        assert_eq!(Signal::Recording { active: true }.tag(), "recording");
+        assert_eq!(Signal::Kick { reason: None }.tag(), "kick");
+        assert_eq!(Signal::ForceMute { audio_muted: true }.tag(), "forcemute");
+        assert_eq!(Signal::EndRoom { reason: None }.tag(), "endroom");
+    }
+
+    #[test]
+    fn new_signals_json_round_trip() {
+        for sig in [
+            Signal::Media { audio_muted: true, video_muted: false },
+            Signal::ScreenShare { active: true },
+            Signal::RaiseHand { raised: true },
+            Signal::Reaction { emoji: "tada".into() },
+            Signal::Chat { body: "hello world".into() },
+            Signal::Recording { active: false },
+            Signal::Kick { reason: Some("spam".into()) },
+            Signal::ForceMute { audio_muted: true },
+            Signal::EndRoom { reason: Some("done".into()) },
+        ] {
+            let j = serde_json::to_vec(&sig).unwrap();
+            let back: Signal = serde_json::from_slice(&j).unwrap();
+            assert_eq!(sig, back);
+        }
+    }
+
+    // ---- bounds / validation ----
+
+    #[test]
+    fn validate_accepts_in_bounds_signals() {
+        assert!(Signal::Offer { sdp: "v=0".repeat(10) }.validate().is_ok());
+        assert!(Signal::Chat { body: "x".repeat(MAX_CHAT_LEN) }.validate().is_ok());
+        assert!(Signal::Join { display_name: Some("Leif".into()) }.validate().is_ok());
+        assert!(Signal::Reaction { emoji: "👍".into() }.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_oversized_sdp() {
+        let big = Signal::Offer { sdp: "a".repeat(MAX_SDP_LEN + 1) };
+        let err = big.validate().unwrap_err();
+        assert!(err.contains("sdp"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_oversized_candidate_and_name_and_chat() {
+        assert!(
+            Signal::IceCandidate {
+                candidate: "c".repeat(MAX_CANDIDATE_LEN + 1),
+                sdp_mid: None,
+                sdp_m_line_index: None,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(Signal::Join { display_name: Some("n".repeat(MAX_NAME_LEN + 1)) }.validate().is_err());
+        assert!(Signal::Chat { body: "c".repeat(MAX_CHAT_LEN + 1) }.validate().is_err());
+        assert!(Signal::Reaction { emoji: "e".repeat(MAX_REACTION_LEN + 1) }.validate().is_err());
+        assert!(Signal::Kick { reason: Some("r".repeat(MAX_REASON_LEN + 1)) }.validate().is_err());
+    }
+
+    #[test]
+    fn from_bytes_rejects_oversized_frame_cheaply() {
+        // A frame larger than the cap is rejected without trusting/parsing its contents.
+        let huge = vec![b'x'; MAX_ENVELOPE_BYTES + 1];
+        let err = SignalEnvelope::from_bytes(&huge).unwrap_err().to_string();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn from_bytes_rejects_oversized_sdp_payload() {
+        // A well-formed envelope whose SDP exceeds MAX_SDP_LEN is rejected at parse time.
+        let env = SignalEnvelope::directed(
+            "r",
+            "peer",
+            0,
+            0,
+            Signal::Offer { sdp: "a".repeat(MAX_SDP_LEN + 10) },
+        );
+        let bytes = env.to_bytes().unwrap();
+        assert!(bytes.len() <= MAX_ENVELOPE_BYTES, "frame itself is within the hard cap");
+        let err = SignalEnvelope::from_bytes(&bytes).unwrap_err().to_string();
+        assert!(err.contains("invalid ce-meet signal"), "{err}");
+    }
+
+    // ---- freshness ----
+
+    #[test]
+    fn freshness_window_disabled_is_always_fresh() {
+        let e = SignalEnvelope::broadcast("r", 0, 1_000, Signal::Keepalive);
+        assert!(e.is_fresh(9_999_999, 0));
+    }
+
+    #[test]
+    fn freshness_rejects_stale_and_future() {
+        let e = SignalEnvelope::broadcast("r", 0, 1_000, Signal::Keepalive);
+        // within window
+        assert!(e.is_fresh(1_030, 60));
+        // too old
+        assert!(!e.is_fresh(2_000, 60));
+        // far future sent_at (skew/forgery) -> not fresh
+        let future = SignalEnvelope::broadcast("r", 0, 10_000, Signal::Keepalive);
+        assert!(!future.is_fresh(1_000, 60));
+        // small future within skew slack is allowed
+        let slight = SignalEnvelope::broadcast("r", 0, 1_050, Signal::Keepalive);
+        assert!(slight.is_fresh(1_000, 60));
     }
 }

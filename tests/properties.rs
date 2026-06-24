@@ -8,24 +8,38 @@
 //! These validate the invariants the foundation rests on, not just example cases.
 
 use ce_meet::order::OrderedInbox;
-use ce_meet::proto::{Signal, SignalEnvelope};
+use ce_meet::proto::{MAX_SDP_LEN, Signal, SignalEnvelope};
 use ce_meet::room::Room;
-use ce_meet::turn::TurnCredential;
+use ce_meet::turn::{RelayCandidate, TurnCredential, select_relay};
 use proptest::prelude::*;
 use std::collections::BTreeSet;
 
-/// An arbitrary Signal.
+/// An arbitrary, in-bounds Signal (string fields kept within the wire `MAX_*` caps so the envelope
+/// survives the bounds-checking `from_bytes`). Covers every signal variant including the media-control
+/// and moderation additions.
 fn any_signal() -> impl Strategy<Value = Signal> {
+    // A short display name (<= MAX_NAME_LEN).
+    let name = "[a-zA-Z0-9 ]{0,32}";
     prop_oneof![
-        any::<Option<String>>().prop_map(|d| Signal::Join { display_name: d }),
+        proptest::option::of(name).prop_map(|d| Signal::Join { display_name: d }),
         Just(Signal::Leave),
         Just(Signal::Keepalive),
-        ".*".prop_map(|s| Signal::Offer { sdp: s }),
-        ".*".prop_map(|s| Signal::Answer { sdp: s }),
-        (".*", any::<Option<String>>(), any::<Option<u32>>()).prop_map(|(c, m, i)| {
-            Signal::IceCandidate { candidate: c, sdp_mid: m, sdp_m_line_index: i }
-        }),
+        "[ -~]{0,256}".prop_map(|s| Signal::Offer { sdp: s }),
+        "[ -~]{0,256}".prop_map(|s| Signal::Answer { sdp: s }),
+        ("[ -~]{0,128}", proptest::option::of("[a-z0-9]{0,8}"), any::<Option<u32>>()).prop_map(
+            |(c, m, i)| { Signal::IceCandidate { candidate: c, sdp_mid: m, sdp_m_line_index: i } }
+        ),
         Just(Signal::IceEnd),
+        (any::<bool>(), any::<bool>())
+            .prop_map(|(a, v)| Signal::Media { audio_muted: a, video_muted: v }),
+        any::<bool>().prop_map(|a| Signal::ScreenShare { active: a }),
+        any::<bool>().prop_map(|r| Signal::RaiseHand { raised: r }),
+        "[a-z]{0,16}".prop_map(|e| Signal::Reaction { emoji: e }),
+        "[ -~]{0,256}".prop_map(|b| Signal::Chat { body: b }),
+        any::<bool>().prop_map(|a| Signal::Recording { active: a }),
+        proptest::option::of("[ -~]{0,64}").prop_map(|r| Signal::Kick { reason: r }),
+        any::<bool>().prop_map(|a| Signal::ForceMute { audio_muted: a }),
+        proptest::option::of("[ -~]{0,64}").prop_map(|r| Signal::EndRoom { reason: r }),
     ]
 }
 
@@ -46,7 +60,7 @@ fn any_envelope() -> impl Strategy<Value = SignalEnvelope> {
 proptest! {
     #[test]
     fn envelope_json_round_trips(env in any_envelope()) {
-        let bytes = env.to_bytes();
+        let bytes = env.to_bytes().unwrap();
         let back = SignalEnvelope::from_bytes(&bytes).unwrap();
         prop_assert_eq!(env, back);
     }
@@ -279,6 +293,121 @@ proptest! {
                 }
                 last = Some(out.seq);
             }
+        }
+    }
+
+    /// Bounds: any signal whose strings are within the documented caps validates; pushing the
+    /// largest bounded field one byte over the cap always fails. (No oversized blob slips through.)
+    #[test]
+    fn validate_is_exact_at_the_sdp_boundary(extra in 0usize..4) {
+        let at_cap = Signal::Offer { sdp: "a".repeat(MAX_SDP_LEN) };
+        prop_assert!(at_cap.validate().is_ok());
+        let over = Signal::Offer { sdp: "a".repeat(MAX_SDP_LEN + 1 + extra) };
+        prop_assert!(over.validate().is_err());
+    }
+
+    /// Media-control state converges: a member's join plus an arbitrary permutation (with a duplicate)
+    /// of mute/share/hand toggles yields the same final per-member media state regardless of order.
+    /// Each toggle gets a unique, strictly-increasing seq (the well-behaved-sender contract: a sender
+    /// never emits two different values at the same seq), so the per-attribute LWW has a clear winner.
+    #[test]
+    fn media_state_converges_under_permutation(
+        kinds in proptest::collection::vec((0u8..3, any::<bool>()), 1..8),
+        rot in any::<u64>(),
+    ) {
+        // Assign a unique seq per toggle by index (1-based; 0 is the join).
+        let toggles: Vec<(u64, u8, bool)> =
+            kinds.iter().enumerate().map(|(i, (k, v))| (i as u64 + 1, *k, *v)).collect();
+
+        let to_sig = |(_, kind, val): &(u64, u8, bool)| match kind {
+            0 => Signal::Media { audio_muted: *val, video_muted: false },
+            1 => Signal::ScreenShare { active: *val },
+            _ => Signal::RaiseHand { raised: *val },
+        };
+
+        let mut reference = Room::new("r", "me");
+        reference.apply(&SignalEnvelope::broadcast("r", 0, 0, Signal::Join { display_name: None }).with_sender("m"));
+        for t in &toggles {
+            reference.apply(&SignalEnvelope::broadcast("r", t.0, t.0, to_sig(t)).with_sender("m"));
+        }
+
+        let mut shuffled = toggles.clone();
+        let n = shuffled.len();
+        shuffled.rotate_left((rot as usize) % n);
+        if let Some(first) = toggles.first().copied() { shuffled.push(first); } // duplicate delivery
+
+        let mut other = Room::new("r", "me");
+        other.apply(&SignalEnvelope::broadcast("r", 0, 0, Signal::Join { display_name: None }).with_sender("m"));
+        for t in &shuffled {
+            other.apply(&SignalEnvelope::broadcast("r", t.0, t.0, to_sig(t)).with_sender("m"));
+        }
+
+        let a = reference.member("m").unwrap();
+        let b = other.member("m").unwrap();
+        prop_assert_eq!((a.audio_muted, a.sharing, a.hand_raised),
+                        (b.audio_muted, b.sharing, b.hand_raised));
+    }
+
+    /// The member cap is never exceeded for any flood of distinct senders.
+    #[test]
+    fn member_cap_is_never_exceeded(
+        cap in 1usize..32,
+        senders in 1usize..200,
+    ) {
+        let mut room = Room::new("r", "me").with_max_members(cap);
+        for i in 0..senders {
+            let from = format!("s{i}");
+            room.apply(&SignalEnvelope::broadcast("r", 0, 0, Signal::Join { display_name: None }).with_sender(&from));
+        }
+        prop_assert!(room.known_count() <= cap);
+    }
+
+    /// OrderedInbox near u64::MAX: contiguous seqs starting just below the wraparound boundary deliver
+    /// in order without panicking (saturating arithmetic guards the edge). The buffer never wraps to a
+    /// lower seq.
+    #[test]
+    fn ordered_inbox_handles_high_seqs(
+        base_off in 0u64..5,
+        len in 1u64..6,
+    ) {
+        let base = u64::MAX - 6 + base_off;
+        let mk = |seq: u64| SignalEnvelope::directed("r", "me", seq, 0, Signal::IceEnd).with_sender("peer");
+        let mut inbox = OrderedInbox::with_window(16);
+        let mut delivered: Vec<u64> = Vec::new();
+        // anchor at `base`, then deliver base..base+len (saturating at u64::MAX)
+        for k in 0..len {
+            let seq = base.saturating_add(k);
+            for out in inbox.offer(mk(seq)) {
+                delivered.push(out.seq);
+            }
+        }
+        // output is monotonic and within [base, u64::MAX]
+        for w in delivered.windows(2) {
+            prop_assert!(w[1] > w[0]);
+        }
+        prop_assert!(delivered.iter().all(|&s| s >= base));
+    }
+
+    /// select_relay output is a stable, score-ordered permutation of its input (same multiset, sorted
+    /// best-first), for arbitrary candidate sets. Never drops or invents a candidate.
+    #[test]
+    fn select_relay_is_a_stable_permutation(
+        cands in proptest::collection::vec((0u32..500, 0.0f32..1.0), 0..16),
+    ) {
+        let input: Vec<RelayCandidate> = cands.iter().enumerate().map(|(i, (rtt, rep))| {
+            let mut c = RelayCandidate::new(format!("node{i:04}"), format!("turn:r{i}:3478"));
+            c.rtt_ms = *rtt;
+            c.reputation = *rep;
+            c
+        }).collect();
+        let ranked = select_relay(input.clone());
+        // same set of node ids
+        let in_ids: BTreeSet<_> = input.iter().map(|c| c.node_id.clone()).collect();
+        let out_ids: BTreeSet<_> = ranked.iter().map(|c| c.node_id.clone()).collect();
+        prop_assert_eq!(in_ids, out_ids);
+        // sorted best-first (non-decreasing score)
+        for w in ranked.windows(2) {
+            prop_assert!(w[0].score() <= w[1].score());
         }
     }
 }

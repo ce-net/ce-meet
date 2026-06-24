@@ -19,7 +19,12 @@ use crate::proto::{Signal, SignalEnvelope};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// One member's presence in the local roster view.
+/// One member's presence and live media state in the local roster view.
+///
+/// Presence (`present`) is the LWW register described in the module docs. The media-control fields
+/// (`audio_muted`, `video_muted`, `sharing`, `hand_raised`) mirror Google Meet's per-tile state; they
+/// are last-writer-wins by the same per-member `seq`, so they converge under reordering exactly like
+/// presence does. They are cosmetic call state, excluded from the membership [`Room::digest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
     /// The member's authenticated NodeId (hex).
@@ -32,6 +37,72 @@ pub struct Member {
     pub last_seq: u64,
     /// `sent_at` of the last applied envelope from this member (freshness for liveness pruning).
     pub last_seen: u64,
+    /// Live microphone-muted state (from the member's most recent `Media` signal). Defaults false.
+    #[serde(default)]
+    pub audio_muted: bool,
+    /// Live camera-off state (from the member's most recent `Media` signal). Defaults false.
+    #[serde(default)]
+    pub video_muted: bool,
+    /// Whether the member is currently presenting a screen (from `ScreenShare`). Defaults false.
+    #[serde(default)]
+    pub sharing: bool,
+    /// Whether the member has a raised hand (from `RaiseHand`). Defaults false.
+    #[serde(default)]
+    pub hand_raised: bool,
+    /// Per-attribute LWW floors for the three independent media dimensions `(media/av, screen-share,
+    /// raise-hand)`, each holding the **next-acceptable** seq for that attribute (0 = none applied
+    /// yet). Independent floors mean an out-of-order update to one dimension (e.g. a later raise-hand)
+    /// never blocks an earlier, separately-sent update to another (e.g. a mute), which a single shared
+    /// seq register would. Excluded from `digest` (cosmetic call state, not membership identity).
+    #[serde(default)]
+    pub media_seq: u64,
+    #[serde(default)]
+    pub share_seq: u64,
+    #[serde(default)]
+    pub hand_seq: u64,
+}
+
+/// A media-control state update applied to a [`Member`] by [`Room::media_lww`]. Each variant targets
+/// one independent media dimension with its own LWW sequence floor.
+enum MediaUpdate {
+    /// Set audio/video mute state (from a `Media` signal).
+    Av { audio_muted: bool, video_muted: bool },
+    /// Set screen-share state (from a `ScreenShare` signal).
+    Sharing(bool),
+    /// Set raised-hand state (from a `RaiseHand` signal).
+    Hand(bool),
+}
+
+impl MediaUpdate {
+    /// The current per-attribute seq floor for this dimension on `m`.
+    fn seq_floor(&self, m: &Member) -> u64 {
+        match self {
+            MediaUpdate::Av { .. } => m.media_seq,
+            MediaUpdate::Sharing(_) => m.share_seq,
+            MediaUpdate::Hand(_) => m.hand_seq,
+        }
+    }
+
+    /// Apply this update to `m` and advance the matching per-attribute floor to `seq + 1` (the
+    /// next-acceptable seq), so a duplicate of `seq` is then rejected.
+    fn apply_to(&self, m: &mut Member, seq: u64) {
+        let next = seq.saturating_add(1);
+        match *self {
+            MediaUpdate::Av { audio_muted, video_muted } => {
+                m.audio_muted = audio_muted;
+                m.video_muted = video_muted;
+                m.media_seq = next;
+            }
+            MediaUpdate::Sharing(active) => {
+                m.sharing = active;
+                m.share_seq = next;
+            }
+            MediaUpdate::Hand(raised) => {
+                m.hand_raised = raised;
+                m.hand_seq = next;
+            }
+        }
+    }
 }
 
 /// The outcome of applying one envelope to a [`Room`] — what changed, for the caller to react to.
@@ -41,16 +112,55 @@ pub enum Effect {
     Joined(String),
     /// A member became absent.
     Left(String),
-    /// A directed signal (offer/answer/ICE) for `to`; the caller routes it to its WebRTC stack if
-    /// `to` is itself. Carries the full envelope so the caller has the SDP/candidate.
+    /// A directed signal (offer/answer/ICE, or a directed moderation action like kick/force-mute)
+    /// for `to`; the caller routes it to its WebRTC stack / control handler if `to` is itself.
+    /// Carries the full envelope so the caller has the SDP/candidate/reason.
     Directed(Box<SignalEnvelope>),
     /// A liveness ping refreshed a present member; no membership change.
     Refreshed(String),
+    /// A member's media state (mic/cam mute, screen-share, or raised-hand) changed. Carries the
+    /// affected NodeId; read the new state from [`Room::member`].
+    MediaChanged(String),
+    /// A transient broadcast reaction from a member (emoji). Not retained as roster state.
+    Reaction { from: String, emoji: String },
+    /// A broadcast in-call chat line from a member. Not retained as roster state.
+    Chat { from: String, body: String },
+    /// A member announced the call is being recorded (`true`) or recording stopped (`false`). Carries
+    /// the announcing NodeId so a UI can show a consent banner.
+    Recording { from: String, active: bool },
+    /// The host ended the room for everyone. The caller should tear down and leave.
+    RoomEnded { by: String, reason: Option<String> },
     /// The envelope was a duplicate/reorder/older than known state and changed nothing.
     NoChange,
 }
 
-/// A participant's local view of one room.
+/// The default cap on the number of distinct members a [`Room`] will track. A peer cannot grow a
+/// receiver's roster past this by publishing `Join` envelopes from many forged-looking NodeIds — once
+/// the cap is reached, a *new* (previously unseen) member's join is rejected, bounding memory. Updates
+/// to members already in the roster are always accepted (so a real participant is never starved out).
+/// 1024 is far above any realistic call yet bounds the worst-case allocation.
+pub const DEFAULT_MAX_MEMBERS: usize = 1024;
+
+/// A participant's local view of one room: the convergent roster (presence + per-member media state)
+/// plus this participant's own outbound sequence counter.
+///
+/// ```
+/// use ce_meet::room::{Room, Effect};
+/// use ce_meet::proto::{Signal, SignalEnvelope};
+///
+/// let mut room = Room::new("r", "me");
+/// // A peer's Join arrives (sender-stamped with its authenticated NodeId).
+/// let join = SignalEnvelope::broadcast("r", 0, 10, Signal::Join { display_name: Some("Bob".into()) })
+///     .with_sender("bob");
+/// assert_eq!(room.apply(&join), Effect::Joined("bob".into()));
+/// assert_eq!(room.present(), vec!["bob".to_string()]);
+///
+/// // Bob mutes his mic; the roster reflects it as last-writer-wins media state.
+/// let mute = SignalEnvelope::broadcast("r", 1, 11, Signal::Media { audio_muted: true, video_muted: false })
+///     .with_sender("bob");
+/// assert_eq!(room.apply(&mute), Effect::MediaChanged("bob".into()));
+/// assert!(room.member("bob").unwrap().audio_muted);
+/// ```
 #[derive(Debug, Clone)]
 pub struct Room {
     room_id: String,
@@ -59,12 +169,46 @@ pub struct Room {
     members: HashMap<String, Member>,
     /// This participant's own outbound sequence counter (monotonic).
     next_seq: u64,
+    /// Upper bound on the number of distinct members tracked (DoS guard). See [`DEFAULT_MAX_MEMBERS`].
+    max_members: usize,
+    /// Set once an `EndRoom` is observed, so the caller can stop processing.
+    ended: bool,
 }
 
 impl Room {
-    /// Create a fresh local view of `room_id` for participant `me` (NodeId hex).
+    /// Create a fresh local view of `room_id` for participant `me` (NodeId hex), with the default
+    /// member cap ([`DEFAULT_MAX_MEMBERS`]).
     pub fn new(room_id: impl Into<String>, me: impl Into<String>) -> Self {
-        Room { room_id: room_id.into(), me: me.into(), members: HashMap::new(), next_seq: 0 }
+        Room {
+            room_id: room_id.into(),
+            me: me.into(),
+            members: HashMap::new(),
+            next_seq: 0,
+            max_members: DEFAULT_MAX_MEMBERS,
+            ended: false,
+        }
+    }
+
+    /// Override the maximum number of distinct members this room will track (DoS guard). A value of 0
+    /// is treated as 1. See [`DEFAULT_MAX_MEMBERS`].
+    pub fn with_max_members(mut self, max: usize) -> Self {
+        self.max_members = max.max(1);
+        self
+    }
+
+    /// The configured maximum number of distinct members.
+    pub fn max_members(&self) -> usize {
+        self.max_members
+    }
+
+    /// Number of distinct members tracked (present or absent).
+    pub fn known_count(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Whether an `EndRoom` has been observed for this room.
+    pub fn is_ended(&self) -> bool {
+        self.ended
     }
 
     /// The room id.
@@ -119,9 +263,49 @@ impl Room {
             Signal::Offer { .. }
             | Signal::Answer { .. }
             | Signal::IceCandidate { .. }
-            | Signal::IceEnd => {
-                // Directed peer signaling — surface it; the caller decides if it is addressed to us.
+            | Signal::IceEnd
+            | Signal::Kick { .. }
+            | Signal::ForceMute { .. } => {
+                // Directed peer signaling / directed moderation — surface it; the caller decides if
+                // it is addressed to us. (Authorization of moderation is the host gate's job, not the
+                // roster machine's; the room only routes.)
                 Effect::Directed(Box::new(env.clone()))
+            }
+            Signal::Reaction { emoji } => {
+                // Transient broadcast — not retained, but refresh liveness if the member is present.
+                if let Some(m) = self.members.get_mut(&env.from)
+                    && env.sent_at > m.last_seen
+                {
+                    m.last_seen = env.sent_at;
+                }
+                Effect::Reaction { from: env.from.clone(), emoji: emoji.clone() }
+            }
+            Signal::Chat { body } => {
+                if let Some(m) = self.members.get_mut(&env.from)
+                    && env.sent_at > m.last_seen
+                {
+                    m.last_seen = env.sent_at;
+                }
+                Effect::Chat { from: env.from.clone(), body: body.clone() }
+            }
+            Signal::Recording { active } => {
+                Effect::Recording { from: env.from.clone(), active: *active }
+            }
+            Signal::EndRoom { reason } => {
+                self.ended = true;
+                Effect::RoomEnded { by: env.from.clone(), reason: reason.clone() }
+            }
+            Signal::Media { audio_muted, video_muted } => self.media_lww(
+                &env.from,
+                env.seq,
+                env.sent_at,
+                MediaUpdate::Av { audio_muted: *audio_muted, video_muted: *video_muted },
+            ),
+            Signal::ScreenShare { active } => {
+                self.media_lww(&env.from, env.seq, env.sent_at, MediaUpdate::Sharing(*active))
+            }
+            Signal::RaiseHand { raised } => {
+                self.media_lww(&env.from, env.seq, env.sent_at, MediaUpdate::Hand(*raised))
             }
             Signal::Join { display_name } => {
                 self.lww(&env.from, env.seq, env.sent_at, true, display_name.clone())
@@ -199,6 +383,12 @@ impl Room {
                 }
             }
             None => {
+                // DoS guard: refuse to allocate a slot for a brand-new member once the cap is hit.
+                // Existing members (the `Some` arm above) are always updatable, so a real participant
+                // is never starved; only the unbounded growth from forged-NodeId joins is stopped.
+                if self.members.len() >= self.max_members {
+                    return Effect::NoChange;
+                }
                 self.members.insert(
                     node_id.to_string(),
                     Member {
@@ -207,6 +397,13 @@ impl Room {
                         present,
                         last_seq: seq,
                         last_seen: sent_at,
+                        audio_muted: false,
+                        video_muted: false,
+                        sharing: false,
+                        hand_raised: false,
+                        media_seq: 0,
+                        share_seq: 0,
+                        hand_seq: 0,
                     },
                 );
                 if present {
@@ -215,6 +412,53 @@ impl Room {
                     // First time we hear of someone is via their Leave: record absent, no "left" event.
                     Effect::NoChange
                 }
+            }
+        }
+    }
+
+    /// LWW update for a member's media-control state (mute / screen-share / raised-hand). Each of the
+    /// three media dimensions has its **own** per-attribute seq floor, so it is keyed by the sender's
+    /// monotonic `seq` *per dimension*: a strictly higher seq for that attribute applies the update and
+    /// advances its floor; an equal or older seq is ignored (duplicate/reorder). Using independent
+    /// floors is essential — a later raise-hand must not block an earlier, separately-sent mute, which
+    /// a single shared register would. A media signal from an unknown member creates an absent
+    /// placeholder so the state is retained when their (possibly reordered) `Join` arrives — subject to
+    /// the member cap. Presence (`last_seq`) is untouched: media is not a presence assertion.
+    fn media_lww(&mut self, node_id: &str, seq: u64, sent_at: u64, update: MediaUpdate) -> Effect {
+        match self.members.get_mut(node_id) {
+            Some(m) => {
+                // `floor` is the next-acceptable seq for this attribute (0 = nothing applied yet).
+                // Apply when `seq >= floor`; an older or duplicate seq is ignored.
+                let floor = update.seq_floor(m);
+                if seq < floor {
+                    m.last_seen = sent_at.max(m.last_seen);
+                    return Effect::NoChange;
+                }
+                m.last_seen = sent_at.max(m.last_seen);
+                update.apply_to(m, seq);
+                Effect::MediaChanged(node_id.to_string())
+            }
+            None => {
+                if self.members.len() >= self.max_members {
+                    return Effect::NoChange;
+                }
+                let mut m = Member {
+                    node_id: node_id.to_string(),
+                    display_name: None,
+                    present: false, // not a presence assertion; await their Join
+                    last_seq: 0,
+                    last_seen: sent_at,
+                    audio_muted: false,
+                    video_muted: false,
+                    sharing: false,
+                    hand_raised: false,
+                    media_seq: 0,
+                    share_seq: 0,
+                    hand_seq: 0,
+                };
+                update.apply_to(&mut m, seq);
+                self.members.insert(node_id.to_string(), m);
+                Effect::MediaChanged(node_id.to_string())
             }
         }
     }
@@ -254,11 +498,20 @@ impl Room {
         }
     }
 
-    /// Rebuild a [`Room`] from a persisted [`RoomSnapshot`]. The inverse of [`Room::snapshot`].
+    /// Rebuild a [`Room`] from a persisted [`RoomSnapshot`]. The inverse of [`Room::snapshot`]. The
+    /// member cap resets to [`DEFAULT_MAX_MEMBERS`] (it is a local DoS-policy knob, not persisted
+    /// state); re-apply [`Room::with_max_members`] if a non-default cap is wanted.
     pub fn restore(snap: RoomSnapshot) -> Self {
         let members =
             snap.members.into_iter().map(|m| (m.node_id.clone(), m)).collect::<HashMap<_, _>>();
-        Room { room_id: snap.room_id, me: snap.me, members, next_seq: snap.next_seq }
+        Room {
+            room_id: snap.room_id,
+            me: snap.me,
+            members,
+            next_seq: snap.next_seq,
+            max_members: DEFAULT_MAX_MEMBERS,
+            ended: false,
+        }
     }
 
     /// A deterministic, order-independent digest of the convergent roster state: for every member,
@@ -357,15 +610,52 @@ pub struct RoomSnapshot {
 }
 
 impl RoomSnapshot {
-    /// Serialize to JSON bytes for persistence (disk, blob store, or a resume payload).
-    pub fn to_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).unwrap_or_else(|_| b"{}".to_vec())
+    /// Serialize to JSON bytes for persistence (disk, blob store, or a resume payload). The
+    /// serialization error is surfaced rather than masked behind an empty object.
+    pub fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(|e| anyhow::anyhow!("serialize room snapshot: {e}"))
     }
 
     /// Parse a snapshot from JSON bytes. Rejects malformed input with a descriptive error.
     pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
         serde_json::from_slice(bytes)
             .map_err(|e| anyhow::anyhow!("malformed ce-meet room snapshot: {e}"))
+    }
+
+    /// Persist this snapshot to `path` **atomically**: write to a sibling temp file, fsync it, then
+    /// rename over the destination (and fsync the parent directory on Unix). A crash mid-write can
+    /// never leave a half-written, unparseable snapshot — the destination is either the old contents
+    /// or the new ones, never a torn mix. Used by a host that persists room state across restarts.
+    pub fn save_atomic(&self, path: impl AsRef<std::path::Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let path = path.as_ref();
+        let bytes = self.to_bytes()?;
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        // Unique temp name in the same directory so the rename is atomic (same filesystem).
+        let tmp = parent.join(format!(
+            ".ce-meet-snap-{}-{}.tmp",
+            std::process::id(),
+            self.next_seq
+        ));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.flush()?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all(); // best-effort directory durability
+        }
+        Ok(())
+    }
+
+    /// Load a snapshot previously written by [`RoomSnapshot::save_atomic`].
+    pub fn load(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+        let bytes = std::fs::read(path.as_ref())?;
+        Self::from_bytes(&bytes)
     }
 }
 
@@ -378,6 +668,9 @@ mod tests {
     }
     fn leave(from: &str, seq: u64, at: u64) -> SignalEnvelope {
         SignalEnvelope::broadcast("r", seq, at, Signal::Leave).with_sender(from)
+    }
+    fn bc(from: &str, seq: u64, at: u64, sig: Signal) -> SignalEnvelope {
+        SignalEnvelope::broadcast("r", seq, at, sig).with_sender(from)
     }
 
     #[test]
@@ -508,7 +801,7 @@ mod tests {
         let mut room = Room::new("r", "me");
         room.apply(&join("a", 2, 10));
         let snap = room.snapshot();
-        let bytes = snap.to_bytes();
+        let bytes = snap.to_bytes().unwrap();
         let back = RoomSnapshot::from_bytes(&bytes).unwrap();
         assert_eq!(snap, back);
     }
@@ -634,5 +927,203 @@ mod tests {
             SignalEnvelope::broadcast("r", next, 20, Signal::Leave).with_sender("p");
         assert_eq!(peer_view.apply(&leave_env), Effect::Left("p".into()));
         assert!(peer_view.present().is_empty());
+    }
+
+    // ---- media-control state ----
+
+    #[test]
+    fn media_signal_updates_member_state() {
+        let mut room = Room::new("r", "me");
+        room.apply(&join("a", 0, 10));
+        let eff = room.apply(&bc("a", 1, 11, Signal::Media { audio_muted: true, video_muted: true }));
+        assert_eq!(eff, Effect::MediaChanged("a".into()));
+        let m = room.member("a").unwrap();
+        assert!(m.audio_muted && m.video_muted);
+        // unmute audio, keep video off
+        room.apply(&bc("a", 2, 12, Signal::Media { audio_muted: false, video_muted: true }));
+        let m = room.member("a").unwrap();
+        assert!(!m.audio_muted && m.video_muted);
+    }
+
+    #[test]
+    fn media_state_is_lww_ordered_and_ignores_stale() {
+        let mut room = Room::new("r", "me");
+        room.apply(&join("a", 0, 10));
+        room.apply(&bc("a", 5, 50, Signal::Media { audio_muted: true, video_muted: false }));
+        // a stale (lower seq) media update must not override
+        assert_eq!(
+            room.apply(&bc("a", 3, 30, Signal::Media { audio_muted: false, video_muted: true })),
+            Effect::NoChange
+        );
+        assert!(room.member("a").unwrap().audio_muted);
+        assert!(!room.member("a").unwrap().video_muted);
+    }
+
+    #[test]
+    fn screen_share_and_raise_hand_track() {
+        let mut room = Room::new("r", "me");
+        room.apply(&join("a", 0, 10));
+        room.apply(&bc("a", 1, 11, Signal::ScreenShare { active: true }));
+        assert!(room.member("a").unwrap().sharing);
+        room.apply(&bc("a", 2, 12, Signal::RaiseHand { raised: true }));
+        assert!(room.member("a").unwrap().hand_raised);
+        room.apply(&bc("a", 3, 13, Signal::ScreenShare { active: false }));
+        assert!(!room.member("a").unwrap().sharing);
+        assert!(room.member("a").unwrap().hand_raised, "raised hand persists across unrelated update");
+    }
+
+    #[test]
+    fn media_before_join_creates_absent_placeholder_then_join_converges() {
+        // A reordered Media arrives before the Join; the state is retained, the member absent until
+        // the Join (higher seq? no — Join has lower seq). Verify state survives and presence resolves.
+        let mut room = Room::new("r", "me");
+        // Media at seq 2 arrives first
+        room.apply(&bc("a", 2, 20, Signal::Media { audio_muted: true, video_muted: false }));
+        assert!(!room.member("a").unwrap().present, "media is not a presence assertion");
+        assert!(room.member("a").unwrap().audio_muted);
+        // Join at seq 0 is older -> ignored for presence (seq < last_seq), member stays absent.
+        assert_eq!(room.apply(&join("a", 0, 10)), Effect::NoChange);
+        // A newer Join (seq 3) marks present and keeps the media state.
+        assert_eq!(room.apply(&join("a", 3, 30)), Effect::Joined("a".into()));
+        assert!(room.member("a").unwrap().audio_muted);
+        assert!(room.member("a").unwrap().present);
+    }
+
+    #[test]
+    fn media_state_excluded_from_digest() {
+        let mut r1 = Room::new("r", "me");
+        let mut r2 = Room::new("r", "me");
+        r1.apply(&join("a", 0, 10));
+        r2.apply(&join("a", 0, 10));
+        // r1 sees a mute (advances seq), r2 does not. digest excludes media but DOES include last_seq,
+        // so to compare membership identity alone we compare present-sets.
+        r1.apply(&bc("a", 1, 11, Signal::Media { audio_muted: true, video_muted: false }));
+        assert_eq!(r1.present(), r2.present());
+        assert!(r1.member("a").unwrap().audio_muted);
+        assert!(!r2.member("a").unwrap().audio_muted);
+    }
+
+    // ---- transient broadcasts: reaction / chat / recording / end-room ----
+
+    #[test]
+    fn reaction_and_chat_surface_without_roster_change() {
+        let mut room = Room::new("r", "me");
+        room.apply(&join("a", 0, 10));
+        let before = room.digest();
+        let eff = room.apply(&bc("a", 1, 11, Signal::Reaction { emoji: "👍".into() }));
+        assert_eq!(eff, Effect::Reaction { from: "a".into(), emoji: "👍".into() });
+        let eff = room.apply(&bc("a", 2, 12, Signal::Chat { body: "hi".into() }));
+        assert_eq!(eff, Effect::Chat { from: "a".into(), body: "hi".into() });
+        // reactions/chat do not advance the LWW seq register (they are not membership)
+        assert_eq!(room.digest(), before, "transient broadcasts leave membership identity unchanged");
+        assert_eq!(room.present(), vec!["a"]);
+    }
+
+    #[test]
+    fn recording_consent_surfaces() {
+        let mut room = Room::new("r", "me");
+        room.apply(&join("host", 0, 10));
+        let eff = room.apply(&bc("host", 1, 11, Signal::Recording { active: true }));
+        assert_eq!(eff, Effect::Recording { from: "host".into(), active: true });
+    }
+
+    #[test]
+    fn end_room_sets_ended_and_surfaces() {
+        let mut room = Room::new("r", "me");
+        room.apply(&join("host", 0, 10));
+        assert!(!room.is_ended());
+        let eff = room.apply(&bc("host", 1, 11, Signal::EndRoom { reason: Some("done".into()) }));
+        assert_eq!(eff, Effect::RoomEnded { by: "host".into(), reason: Some("done".into()) });
+        assert!(room.is_ended());
+    }
+
+    #[test]
+    fn directed_moderation_surfaces_as_directed() {
+        let mut room = Room::new("r", "me");
+        let kick = SignalEnvelope::directed("r", "me", 0, 10, Signal::Kick { reason: None })
+            .with_sender("host");
+        match room.apply(&kick) {
+            Effect::Directed(e) => assert_eq!(e.signal.tag(), "kick"),
+            other => panic!("expected Directed kick, got {other:?}"),
+        }
+        let fm = SignalEnvelope::directed("r", "me", 1, 11, Signal::ForceMute { audio_muted: true })
+            .with_sender("host");
+        match room.apply(&fm) {
+            Effect::Directed(e) => assert_eq!(e.signal.tag(), "forcemute"),
+            other => panic!("expected Directed force-mute, got {other:?}"),
+        }
+        // directed moderation never alters the roster
+        assert_eq!(room.present_count(), 0);
+    }
+
+    // ---- member cap (DoS guard) ----
+
+    #[test]
+    fn member_cap_rejects_new_members_beyond_limit() {
+        let mut room = Room::new("r", "me").with_max_members(3);
+        assert_eq!(room.max_members(), 3);
+        for i in 0..3 {
+            assert_eq!(room.apply(&join(&format!("m{i}"), 0, 10)), Effect::Joined(format!("m{i}")));
+        }
+        assert_eq!(room.known_count(), 3);
+        // a 4th distinct member is refused (no allocation)
+        assert_eq!(room.apply(&join("overflow", 0, 10)), Effect::NoChange);
+        assert_eq!(room.known_count(), 3);
+        assert!(!room.present().contains(&"overflow".to_string()));
+    }
+
+    #[test]
+    fn member_cap_still_allows_updates_to_known_members() {
+        let mut room = Room::new("r", "me").with_max_members(2);
+        room.apply(&join("a", 0, 10));
+        room.apply(&join("b", 0, 10));
+        // cap reached; but an existing member can still leave/rejoin
+        assert_eq!(room.apply(&leave("a", 1, 11)), Effect::Left("a".into()));
+        assert_eq!(room.apply(&join("a", 2, 12)), Effect::Joined("a".into()));
+        // and media updates to a known member are accepted
+        assert_eq!(
+            room.apply(&bc("b", 1, 11, Signal::Media { audio_muted: true, video_muted: false })),
+            Effect::MediaChanged("b".into())
+        );
+    }
+
+    #[test]
+    fn member_cap_zero_is_clamped_to_one() {
+        let room = Room::new("r", "me").with_max_members(0);
+        assert_eq!(room.max_members(), 1);
+    }
+
+    #[test]
+    fn media_signal_respects_member_cap() {
+        let mut room = Room::new("r", "me").with_max_members(1);
+        room.apply(&join("a", 0, 10));
+        // a media signal from a NEW member beyond the cap is dropped
+        assert_eq!(
+            room.apply(&bc("b", 0, 10, Signal::ScreenShare { active: true })),
+            Effect::NoChange
+        );
+        assert_eq!(room.known_count(), 1);
+    }
+
+    // ---- atomic persistence ----
+
+    #[test]
+    fn save_atomic_then_load_round_trips() {
+        let mut room = Room::new("r", "me");
+        room.apply(&join("a", 0, 10));
+        room.apply(&bc("a", 1, 11, Signal::Media { audio_muted: true, video_muted: false }));
+        let snap = room.snapshot();
+        let dir = std::env::temp_dir().join(format!("ce-meet-snap-{}", std::process::id()));
+        let path = dir.join("room.json");
+        snap.save_atomic(&path).unwrap();
+        let back = RoomSnapshot::load(&path).unwrap();
+        assert_eq!(snap, back);
+        // overwrite atomically with a newer snapshot
+        room.apply(&leave("a", 2, 12));
+        let snap2 = room.snapshot();
+        snap2.save_atomic(&path).unwrap();
+        let back2 = RoomSnapshot::load(&path).unwrap();
+        assert_eq!(snap2, back2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

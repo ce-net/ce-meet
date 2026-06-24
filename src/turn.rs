@@ -42,8 +42,35 @@
 //! browser where to relay. Planned (documented, not coded here): the coturn sidecar on relay nodes,
 //! the channel-bound TURN REST credential issuance endpoint, and the SFU cell image.
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Constant-time byte-slice equality (length-aware) so credential verification does not leak the
+/// password via timing. Returns false immediately on a length mismatch (length is not secret).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// The keyed digest backing a [`TurnCredential`] password: `hex(HMAC-SHA256(secret, username))`.
+/// A real keyed MAC rather than `sha256(secret||username)`.
+fn turn_password(shared_secret: &[u8], username: &str) -> String {
+    let mut mac = match HmacSha256::new_from_slice(shared_secret) {
+        Ok(m) => m,
+        Err(_) => return String::new(), // impossible for HMAC; an empty password never verifies.
+    };
+    mac.update(username.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
 
 /// The DHT service string a node advertises when it is willing to act as a paid TURN relay. A room
 /// host discovers relays via `ce_rs::CeClient::find_service(SERVICE_TURN)`.
@@ -88,9 +115,9 @@ impl IceServer {
 /// is opened; the browser uses `username`/`password` for the TURN long-term-credential mechanism.
 ///
 /// The credential follows the widely-deployed "TURN REST API" ephemeral-credential convention:
-/// `username = "<expiry_unix>:<channel_id>"` and `password = base64(HMAC-ish digest)`. Here the
-/// digest is `sha256(shared_secret || username)` — deterministic so the relay can re-derive and
-/// verify it statelessly, expiring so a leak is bounded.
+/// `username = "<expiry_unix>:<channel_id>"` and `password = hex(HMAC-SHA256(shared_secret,
+/// username))` — a real keyed MAC, deterministic so the relay can re-derive and verify it statelessly,
+/// expiring so a leak is bounded. Verification uses a constant-time compare to avoid a timing leak.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnCredential {
     /// TURN username: `"<expiry_unix>:<channel_id>"`.
@@ -110,40 +137,105 @@ impl TurnCredential {
     pub fn derive(channel_id: &str, shared_secret: &[u8], now: u64, ttl_secs: u64) -> Self {
         let expires_at = now.saturating_add(ttl_secs);
         let username = format!("{expires_at}:{channel_id}");
-        let mut h = Sha256::new();
-        h.update(shared_secret);
-        h.update(username.as_bytes());
-        let password = hex::encode(h.finalize());
+        let password = turn_password(shared_secret, &username);
         TurnCredential { username, password, expires_at, channel_id: channel_id.to_string() }
     }
 
-    /// Re-derive and constant-purpose-check a presented credential against the relay's secret.
-    /// Returns true only if the password matches the derivation and the credential is unexpired at
-    /// `now`. The relay calls this to authorize a TURN allocation without storing per-client state.
+    /// Re-derive and check a presented credential against the relay's secret. Returns true only if the
+    /// username is well-formed for `(expires_at, channel_id)`, the HMAC password re-derives (compared
+    /// in constant time), and the credential is unexpired at `now`. The relay calls this to authorize a
+    /// TURN allocation without storing per-client state.
     pub fn verify(&self, shared_secret: &[u8], now: u64) -> bool {
         if now > self.expires_at {
             return false;
         }
-        let expected = Self::derive(&self.channel_id, shared_secret, self.expires_at.saturating_sub(0), 0);
-        // derive() with ttl 0 and now==expires_at reproduces the same username+password.
-        let recomputed = {
-            let username = format!("{}:{}", self.expires_at, self.channel_id);
-            if username != self.username {
-                return false;
-            }
-            let mut h = Sha256::new();
-            h.update(shared_secret);
-            h.update(username.as_bytes());
-            hex::encode(h.finalize())
-        };
-        let _ = expected; // keep the symmetry obvious; recomputed is the authoritative check
-        recomputed == self.password
+        // The username must be exactly the one the password is bound to (no substitution).
+        let expected_username = format!("{}:{}", self.expires_at, self.channel_id);
+        if !ct_eq(expected_username.as_bytes(), self.username.as_bytes()) {
+            return false;
+        }
+        let expected = turn_password(shared_secret, &self.username);
+        ct_eq(expected.as_bytes(), self.password.as_bytes())
     }
 
     /// Render this credential as an [`IceServer`] for a given TURN URL, ready to hand to a browser.
     pub fn ice_server(&self, turn_url: impl Into<String>) -> IceServer {
         IceServer::turn(turn_url, self.username.clone(), self.password.clone())
     }
+}
+
+/// A discovered TURN relay candidate, as ranked for host selection. A room host obtains the raw
+/// provider NodeIds from `ce_rs::CeClient::find_service(`[`SERVICE_TURN`]`)`, then enriches each with a
+/// reputation/latency score (from the atlas + `/history`) and ranks them with [`select_relay`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelayCandidate {
+    /// The relay's NodeId (hex), from the discovery lookup.
+    pub node_id: String,
+    /// The relay's advertised TURN URL (e.g. `turn:relay.ce-net.com:3478?transport=udp`).
+    pub turn_url: String,
+    /// Round-trip latency estimate in milliseconds (lower is better); `u32::MAX` if unknown.
+    pub rtt_ms: u32,
+    /// A reputation score in `0.0..=1.0` derived by the host from the `/history` substrate (higher is
+    /// better). A brand-new relay defaults low so a proven one is preferred under equal latency.
+    pub reputation: f32,
+}
+
+impl RelayCandidate {
+    /// Build a candidate with an unknown RTT and zero reputation — the floor a host starts from before
+    /// enriching with atlas/history data.
+    pub fn new(node_id: impl Into<String>, turn_url: impl Into<String>) -> Self {
+        RelayCandidate {
+            node_id: node_id.into(),
+            turn_url: turn_url.into(),
+            rtt_ms: u32::MAX,
+            reputation: 0.0,
+        }
+    }
+
+    /// A composite selection score: lower is better. Latency dominates (a far relay relays media
+    /// badly) but a higher reputation breaks ties and discounts latency slightly, so a proven nearby
+    /// relay beats an unknown one at the same RTT. Pure and deterministic for a stable ranking.
+    pub fn score(&self) -> f64 {
+        // Normalize reputation into a [0,1] discount; clamp defensively against bad inputs.
+        let rep = self.reputation.clamp(0.0, 1.0) as f64;
+        // A relay with unknown RTT is treated as far (but still selectable if it's the only one).
+        let rtt = self.rtt_ms as f64;
+        // Discount up to 20% of latency for a perfect reputation.
+        rtt * (1.0 - 0.2 * rep)
+    }
+}
+
+/// Rank discovered relay candidates and return them best-first (lowest [`RelayCandidate::score`]).
+/// Deterministic: ties break by NodeId so the selection is stable across hosts. Returns an empty vec
+/// for no candidates (the room then runs pure-P2P with STUN only). This is the *selection* logic of
+/// the media tier; the live `find_service` lookup and the channel-bound credential issuance that feed
+/// it are wired by the host (see the crate README's "Implemented vs planned" boundary).
+///
+/// ```
+/// use ce_meet::turn::{RelayCandidate, select_relay};
+/// let mut near = RelayCandidate::new("bb", "turn:near:3478");
+/// near.rtt_ms = 20;
+/// let mut far = RelayCandidate::new("aa", "turn:far:3478");
+/// far.rtt_ms = 200;
+/// far.reputation = 1.0;
+/// let ranked = select_relay(vec![far, near]);
+/// assert_eq!(ranked[0].turn_url, "turn:near:3478"); // latency dominates reputation
+/// ```
+pub fn select_relay(mut candidates: Vec<RelayCandidate>) -> Vec<RelayCandidate> {
+    candidates.sort_by(|a, b| {
+        a.score()
+            .partial_cmp(&b.score())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+    candidates
+}
+
+/// The standard set of public-ish STUN servers a room offers for the zero-cost reflexive probe when
+/// no paid relay is selected. A host may override this; it exists so an open room is usable with no
+/// configuration. (STUN only — no credentials, no relayed bytes, no cost.)
+pub fn default_stun_servers() -> Vec<IceServer> {
+    vec![IceServer::stun("stun:stun.l.google.com:19302")]
 }
 
 #[cfg(test)]
@@ -207,5 +299,76 @@ mod tests {
         let ice = cred.ice_server("turn:relay:3478");
         assert!(ice.is_turn());
         assert_eq!(ice.username.as_deref(), Some(cred.username.as_str()));
+    }
+
+    #[test]
+    fn ct_eq_basic() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"ab")); // length mismatch
+    }
+
+    #[test]
+    fn password_is_hmac_not_plain_sha256() {
+        // The password must equal HMAC-SHA256(secret, username), not sha256(secret||username).
+        use hmac::Mac;
+        let secret = b"relay-secret";
+        let cred = TurnCredential::derive("chan", secret, 1000, 60);
+        let mut mac = HmacSha256::new_from_slice(secret).unwrap();
+        mac.update(cred.username.as_bytes());
+        let expected = hex::encode(mac.finalize().into_bytes());
+        assert_eq!(cred.password, expected);
+        // A plain sha256(secret||username) would differ.
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(secret);
+        h.update(cred.username.as_bytes());
+        assert_ne!(cred.password, hex::encode(h.finalize()));
+    }
+
+    #[test]
+    fn select_relay_ranks_by_latency_then_reputation() {
+        let mut near = RelayCandidate::new("aa".repeat(32), "turn:near:3478");
+        near.rtt_ms = 20;
+        near.reputation = 0.1;
+        let mut far = RelayCandidate::new("bb".repeat(32), "turn:far:3478");
+        far.rtt_ms = 100;
+        far.reputation = 1.0;
+        let ranked = select_relay(vec![far.clone(), near.clone()]);
+        assert_eq!(ranked[0].node_id, near.node_id, "the nearer relay wins despite lower reputation");
+    }
+
+    #[test]
+    fn select_relay_reputation_breaks_latency_tie() {
+        let mut a = RelayCandidate::new("11".repeat(32), "turn:a:3478");
+        a.rtt_ms = 50;
+        a.reputation = 0.0;
+        let mut b = RelayCandidate::new("22".repeat(32), "turn:b:3478");
+        b.rtt_ms = 50;
+        b.reputation = 1.0;
+        let ranked = select_relay(vec![a.clone(), b.clone()]);
+        assert_eq!(ranked[0].node_id, b.node_id, "equal RTT -> higher reputation wins");
+    }
+
+    #[test]
+    fn select_relay_empty_is_empty() {
+        assert!(select_relay(vec![]).is_empty());
+    }
+
+    #[test]
+    fn select_relay_is_deterministic_for_identical_scores() {
+        let a = RelayCandidate::new("ff".repeat(32), "turn:a:3478");
+        let b = RelayCandidate::new("00".repeat(32), "turn:b:3478");
+        let r1 = select_relay(vec![a.clone(), b.clone()]);
+        let r2 = select_relay(vec![b, a]);
+        assert_eq!(r1, r2, "tie-break by node_id is stable regardless of input order");
+        assert_eq!(r1[0].node_id, "00".repeat(32));
+    }
+
+    #[test]
+    fn default_stun_is_stun_only() {
+        let s = default_stun_servers();
+        assert!(!s.is_empty());
+        assert!(s.iter().all(|i| !i.is_turn()));
     }
 }

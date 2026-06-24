@@ -34,28 +34,61 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The default freshness window (seconds) for directed signals when freshness enforcement is on.
+/// A trickled ICE candidate older than this (by its `sent_at`) is dropped rather than fed to the
+/// WebRTC stack — a stale candidate can stall renegotiation. 0 elsewhere means "disabled".
+pub const DEFAULT_FRESHNESS_SECS: u64 = 30;
+
 /// A participant's signaling client for one room.
 pub struct MeetClient {
     ce: CeClient,
     room: Room,
     /// Per-peer reorder buffer for directed SDP/ICE signals (in-order, de-duplicated delivery).
     router: SignalRouter,
+    /// When non-zero, directed signals whose `sent_at` is older than this many seconds (or implausibly
+    /// far in the future) are discarded by [`MeetClient::ingest_ordered`]. 0 = no freshness check.
+    freshness_secs: u64,
 }
 
 impl MeetClient {
     /// Build a client bound to a local CE node and a room, for participant `me` (NodeId hex). Get
-    /// `me` from `ce.status().await?.node_id`.
+    /// `me` from `ce.status().await?.node_id`. Freshness enforcement starts disabled; enable it with
+    /// [`MeetClient::with_freshness`].
     pub fn new(ce: CeClient, room_id: impl Into<String>, me: impl Into<String>) -> Self {
         let room_id = room_id.into();
         let me = me.into();
-        MeetClient { ce, room: Room::new(room_id, me), router: SignalRouter::new() }
+        MeetClient {
+            ce,
+            room: Room::new(room_id, me),
+            router: SignalRouter::new(),
+            freshness_secs: 0,
+        }
+    }
+
+    /// Enable (or change) the directed-signal freshness window in seconds. With it set, an SDP/ICE
+    /// signal whose `sent_at` is older than `secs` (or implausibly future) is dropped by
+    /// [`MeetClient::ingest_ordered`] before reaching the WebRTC stack. Pass 0 to disable. A typical
+    /// value is [`DEFAULT_FRESHNESS_SECS`].
+    pub fn with_freshness(mut self, secs: u64) -> Self {
+        self.freshness_secs = secs;
+        self
+    }
+
+    /// The configured directed-signal freshness window (0 = disabled).
+    pub fn freshness_secs(&self) -> u64 {
+        self.freshness_secs
     }
 
     /// Rebuild a client from a persisted [`RoomSnapshot`] (host or participant resuming after a
     /// crash). The roster, member LWW state, and outbound `seq` are restored intact; the directed-
     /// signal reorder buffer starts fresh (per-peer ordering re-anchors on the next directed signal).
     pub fn restore(ce: CeClient, snapshot: RoomSnapshot) -> Self {
-        MeetClient { ce, room: Room::restore(snapshot), router: SignalRouter::new() }
+        MeetClient {
+            ce,
+            room: Room::restore(snapshot),
+            router: SignalRouter::new(),
+            freshness_secs: 0,
+        }
     }
 
     /// The room id this client is bound to.
@@ -126,9 +159,75 @@ impl MeetClient {
         self.publish(&env).await
     }
 
-    /// Low-level publish of a pre-built envelope onto the room topic.
+    /// Broadcast any [`Signal`] to the whole room (allocating the next outbound seq). The building
+    /// block for the media-control / chat / reaction helpers below.
+    pub async fn broadcast(&mut self, signal: Signal) -> Result<()> {
+        let seq = self.room.next_outbound_seq();
+        let env = SignalEnvelope::broadcast(self.room.room_id(), seq, now_secs(), signal);
+        self.publish(&env).await
+    }
+
+    /// Send a directed control [`Signal`] (a moderation action such as `Kick`/`ForceMute`) to one
+    /// peer. Whether the recipient honors it is decided by *its* host gate — the sender's authority is
+    /// a capability the recipient verifies, never asserted here.
+    pub async fn signal_directed(&mut self, to: &str, signal: Signal) -> Result<()> {
+        self.signal_peer(to, signal).await
+    }
+
+    /// Broadcast this participant's live mic/camera mute state (Meet's per-tile mute indicators).
+    pub async fn set_media(&mut self, audio_muted: bool, video_muted: bool) -> Result<()> {
+        self.broadcast(Signal::Media { audio_muted, video_muted }).await
+    }
+
+    /// Broadcast that this participant started or stopped sharing their screen.
+    pub async fn set_screen_share(&mut self, active: bool) -> Result<()> {
+        self.broadcast(Signal::ScreenShare { active }).await
+    }
+
+    /// Broadcast raising or lowering this participant's hand.
+    pub async fn raise_hand(&mut self, raised: bool) -> Result<()> {
+        self.broadcast(Signal::RaiseHand { raised }).await
+    }
+
+    /// Broadcast a transient reaction (an emoji/symbol). The body is bounds-validated on publish.
+    pub async fn react(&mut self, emoji: impl Into<String>) -> Result<()> {
+        self.broadcast(Signal::Reaction { emoji: emoji.into() }).await
+    }
+
+    /// Broadcast an in-call chat line. Bounds-validated on publish.
+    pub async fn chat(&mut self, body: impl Into<String>) -> Result<()> {
+        self.broadcast(Signal::Chat { body: body.into() }).await
+    }
+
+    /// Announce that the call is being recorded (`true`) or recording stopped (`false`). ce-meet does
+    /// no recording itself; this is the consent/notice broadcast every participant sees.
+    pub async fn announce_recording(&mut self, active: bool) -> Result<()> {
+        self.broadcast(Signal::Recording { active }).await
+    }
+
+    /// Host/moderator: remove a participant from the room (directed at the target NodeId). The target
+    /// honors it only if the sender holds [`crate::proto::ABILITY_HOST`]/`ABILITY_MODERATE` per the
+    /// target's gate.
+    pub async fn kick(&mut self, target: &str, reason: Option<String>) -> Result<()> {
+        self.signal_directed(target, Signal::Kick { reason }).await
+    }
+
+    /// Host/moderator: force-mute (or request-unmute) a participant's audio (directed).
+    pub async fn force_mute(&mut self, target: &str, audio_muted: bool) -> Result<()> {
+        self.signal_directed(target, Signal::ForceMute { audio_muted }).await
+    }
+
+    /// Host: end the room for everyone (broadcast). Other clients tear down on receipt.
+    pub async fn end_room(&mut self, reason: Option<String>) -> Result<()> {
+        self.broadcast(Signal::EndRoom { reason }).await
+    }
+
+    /// Low-level publish of a pre-built envelope onto the room topic. Validates the envelope's bounds
+    /// before publishing so this node never emits an over-cap frame a peer would reject.
     pub async fn publish(&self, env: &SignalEnvelope) -> Result<()> {
-        self.ce.publish(&room_topic(self.room.room_id()), &env.to_bytes()).await
+        env.signal.validate().map_err(|e| anyhow!("refusing to publish invalid signal: {e}"))?;
+        let bytes = env.to_bytes()?;
+        self.ce.publish(&room_topic(self.room.room_id()), &bytes).await
     }
 
     /// Poll the node's app-message inbox, decode every envelope on this room's topic, stamp it with
@@ -158,6 +257,53 @@ impl MeetClient {
         Ok(effects)
     }
 
+    /// Drive the roster in **real time** from the node's SSE app-message push stream, invoking
+    /// `on_effect` for every meaningful roster change as it arrives (sub-second, unlike the
+    /// timer-based [`MeetClient::poll`]). This is the loop a real WebRTC client runs: the moment a peer
+    /// publishes an offer/candidate or a membership change, it is applied and surfaced.
+    ///
+    /// Filters to this room's topic, ignores our own echoes, and skips malformed frames (never
+    /// panics). Returns when the stream ends (node closed it) or an `EndRoom` is observed. Errors from
+    /// individual stream items are logged and skipped so a transient decode hiccup does not kill the
+    /// call. `on_effect` is a synchronous callback (render/log); do async work by sending on a channel.
+    pub async fn event_loop<F>(&mut self, mut on_effect: F) -> Result<()>
+    where
+        F: FnMut(&Effect),
+    {
+        use futures_util::StreamExt;
+        let topic = room_topic(self.room.room_id());
+        let me = self.room.me().to_string();
+        // Open the stream on a second client targeting the same node, so the long-lived stream borrow
+        // does not conflict with the `&mut self` we need to apply each message. The token is
+        // re-discovered from the environment exactly as for the primary client.
+        let ce = CeClient::new(self.ce.base_url());
+        let stream = ce.messages_stream().await?;
+        futures_util::pin_mut!(stream);
+        while let Some(item) = stream.next().await {
+            let m = match item {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("meet event stream item error: {e}");
+                    continue;
+                }
+            };
+            if m.topic != topic || m.from == me {
+                continue;
+            }
+            let bytes = match m.payload() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if let Some(eff) = self.apply_message(&m.from, &bytes) {
+                on_effect(&eff);
+                if matches!(eff, Effect::RoomEnded { .. }) {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Apply one raw received message (authenticated `from` + payload bytes) to the roster. Returns
     /// `Some(effect)` for a meaningful change, `None` for malformed input or no-ops. Pure-ish: it
     /// mutates the local roster but does no I/O — usable directly from an SSE stream handler.
@@ -184,6 +330,14 @@ impl MeetClient {
             Ok(e) => e.with_sender(from),
             Err(_) => return Vec::new(),
         };
+        // Freshness: drop a stale (or implausibly future) directed signal before it can stall the
+        // WebRTC stack. Applies only when enforcement is enabled (freshness_secs != 0).
+        if self.freshness_secs != 0
+            && !env.signal.is_broadcast()
+            && !env.is_fresh(now_secs(), self.freshness_secs)
+        {
+            return Vec::new();
+        }
         match self.room.apply(&env) {
             Effect::Directed(boxed) => {
                 if boxed.addressed_to(self.room.me()) {
@@ -276,7 +430,7 @@ mod tests {
         let ce = CeClient::with_token("http://127.0.0.1:8844", None);
         let mut client = MeetClient::new(ce, "room", "me");
         let env = SignalEnvelope::broadcast("room", 0, now_secs(), Signal::Join { display_name: None });
-        let eff = client.apply_message("peerA", &env.to_bytes());
+        let eff = client.apply_message("peerA", &env.to_bytes().unwrap());
         assert_eq!(eff, Some(Effect::Joined("peerA".into())));
         assert_eq!(client.room().present(), vec!["peerA"]);
     }
@@ -294,7 +448,7 @@ mod tests {
         let ce = CeClient::with_token("http://127.0.0.1:8844", None);
         let mut client = MeetClient::new(ce, "room", "me");
         let env = SignalEnvelope::broadcast("OTHER", 0, 1, Signal::Join { display_name: None });
-        assert_eq!(client.apply_message("peerA", &env.to_bytes()), None);
+        assert_eq!(client.apply_message("peerA", &env.to_bytes().unwrap()), None);
     }
 
     #[test]
@@ -303,7 +457,7 @@ mod tests {
         let mut client = MeetClient::new(ce, "room", "me");
         let env =
             SignalEnvelope::directed("room", "me", 0, 1, Signal::Offer { sdp: "v=0".into() });
-        match client.apply_message("peerA", &env.to_bytes()) {
+        match client.apply_message("peerA", &env.to_bytes().unwrap()) {
             Some(Effect::Directed(e)) => assert_eq!(e.from, "peerA"),
             other => panic!("expected Directed, got {other:?}"),
         }
@@ -313,7 +467,7 @@ mod tests {
     fn restore_rebuilds_roster_and_outbound_seq() {
         let ce = CeClient::with_token("http://127.0.0.1:8844", None);
         let mut client = MeetClient::new(ce, "room", "me");
-        client.apply_message("peerA", &SignalEnvelope::broadcast("room", 0, 1, Signal::Join { display_name: None }).to_bytes());
+        client.apply_message("peerA", &SignalEnvelope::broadcast("room", 0, 1, Signal::Join { display_name: None }).to_bytes().unwrap());
         client.room.next_outbound_seq(); // advance my own counter
         let snap = client.snapshot();
 
@@ -349,11 +503,11 @@ mod tests {
         let ice1 = SignalEnvelope::directed("room", "me", 1, 2, Signal::IceCandidate {
             candidate: "c1".into(), sdp_mid: None, sdp_m_line_index: None });
 
-        let r0 = client.ingest_ordered("peerA", &offer.to_bytes());
+        let r0 = client.ingest_ordered("peerA", &offer.to_bytes().unwrap());
         assert_eq!(r0.len(), 1);
         assert_eq!(r0[0].seq, 0);
-        assert!(client.ingest_ordered("peerA", &ice2.to_bytes()).is_empty(), "gap buffers");
-        let run = client.ingest_ordered("peerA", &ice1.to_bytes());
+        assert!(client.ingest_ordered("peerA", &ice2.to_bytes().unwrap()).is_empty(), "gap buffers");
+        let run = client.ingest_ordered("peerA", &ice1.to_bytes().unwrap());
         assert_eq!(run.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
     }
 
@@ -363,7 +517,7 @@ mod tests {
         let mut client = MeetClient::new(ce, "room", "me");
         // directed at someone else -> not surfaced to us
         let env = SignalEnvelope::directed("room", "OTHER", 0, 1, Signal::Offer { sdp: "x".into() });
-        assert!(client.ingest_ordered("peerA", &env.to_bytes()).is_empty());
+        assert!(client.ingest_ordered("peerA", &env.to_bytes().unwrap()).is_empty());
     }
 
     #[test]
@@ -373,7 +527,69 @@ mod tests {
         assert!(client.ingest_ordered("peerA", b"not json").is_empty());
         // a broadcast join still updates the roster but yields no directed signals
         let join = SignalEnvelope::broadcast("room", 0, 1, Signal::Join { display_name: None });
-        assert!(client.ingest_ordered("peerA", &join.to_bytes()).is_empty());
+        assert!(client.ingest_ordered("peerA", &join.to_bytes().unwrap()).is_empty());
         assert_eq!(client.room().present(), vec!["peerA"]);
+    }
+
+    #[test]
+    fn apply_message_surfaces_media_and_chat() {
+        let ce = CeClient::with_token("http://127.0.0.1:8844", None);
+        let mut client = MeetClient::new(ce, "room", "me");
+        client.apply_message(
+            "peerA",
+            &SignalEnvelope::broadcast("room", 0, 1, Signal::Join { display_name: None })
+                .to_bytes()
+                .unwrap(),
+        );
+        let media = SignalEnvelope::broadcast(
+            "room",
+            1,
+            2,
+            Signal::Media { audio_muted: true, video_muted: false },
+        );
+        assert_eq!(
+            client.apply_message("peerA", &media.to_bytes().unwrap()),
+            Some(Effect::MediaChanged("peerA".into()))
+        );
+        assert!(client.room().member("peerA").unwrap().audio_muted);
+
+        let chat = SignalEnvelope::broadcast("room", 2, 3, Signal::Chat { body: "hi".into() });
+        assert_eq!(
+            client.apply_message("peerA", &chat.to_bytes().unwrap()),
+            Some(Effect::Chat { from: "peerA".into(), body: "hi".into() })
+        );
+    }
+
+    #[test]
+    fn freshness_drops_stale_directed_signal() {
+        let ce = CeClient::with_token("http://127.0.0.1:8844", None);
+        // freshness window of 30s; an offer with sent_at far in the past is dropped.
+        let mut client = MeetClient::new(ce, "room", "me").with_freshness(30);
+        assert_eq!(client.freshness_secs(), 30);
+        let stale = SignalEnvelope::directed("room", "me", 0, 1, Signal::Offer { sdp: "o".into() });
+        // sent_at = 1 is ancient relative to wall-clock now -> dropped.
+        assert!(client.ingest_ordered("peerA", &stale.to_bytes().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn freshness_disabled_delivers_old_signal() {
+        let ce = CeClient::with_token("http://127.0.0.1:8844", None);
+        // freshness disabled (default) -> even an old sent_at is delivered.
+        let mut client = MeetClient::new(ce, "room", "me");
+        let old = SignalEnvelope::directed("room", "me", 0, 1, Signal::Offer { sdp: "o".into() });
+        let out = client.ingest_ordered("peerA", &old.to_bytes().unwrap());
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn end_room_effect_is_observed() {
+        let ce = CeClient::with_token("http://127.0.0.1:8844", None);
+        let mut client = MeetClient::new(ce, "room", "me");
+        let end = SignalEnvelope::broadcast("room", 0, 1, Signal::EndRoom { reason: None });
+        assert_eq!(
+            client.apply_message("host", &end.to_bytes().unwrap()),
+            Some(Effect::RoomEnded { by: "host".into(), reason: None })
+        );
+        assert!(client.room().is_ended());
     }
 }

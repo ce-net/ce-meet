@@ -12,7 +12,7 @@
 //! the **open-room** shortcut (no capability required) and on-chain revocation lookup.
 
 use anyhow::{Result, anyhow};
-use ce_cap::{SignedCapability, authorize, decode_chain};
+use ce_iam_core::{SignedCapability, authorize, decode_chain};
 use ce_identity::NodeId;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -137,7 +137,7 @@ impl Gate {
 mod tests {
     use super::*;
     use crate::proto::{ABILITY_HOST, ABILITY_JOIN};
-    use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
+    use ce_iam_core::{Caveats, Resource, SignedCapability, encode_chain};
     use ce_identity::Identity;
     use std::sync::atomic::{AtomicU64, Ordering};
 

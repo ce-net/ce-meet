@@ -7,7 +7,7 @@
 //! province of the SDK transport (already tested in ce-rs); here we validate the protocol + state
 //! machine that rides it.
 
-use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
+use ce_iam_core::{Caveats, Resource, SignedCapability, encode_chain};
 use ce_identity::Identity;
 use ce_meet::admit::{AdmitRateLimiter, Admitter};
 use ce_meet::caps::Gate;

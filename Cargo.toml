@@ -23,12 +23,12 @@ path = "src/main.rs"
 [dependencies]
 # The CE SDK: mesh pubsub (subscribe/publish), directed messaging (send/request/reply),
 # discovery, status/atlas. The signaling plane is built entirely on these primitives.
-ce-rs = { path = "../ce-rs" }
+ce-rs = { git = "https://github.com/ce-net/ce-rs" }
 # The capability verifier primitive — a room host authorizes a signed attenuating chain before
 # admitting a peer or honoring a moderation action. Abilities are opaque app-chosen strings.
-ce-cap = { path = "../ce/crates/ce-cap" }
+ce-iam-core = { git = "https://github.com/ce-net/ce-iam" }
 # Identity provides the NodeId type the gate authorizes against (and hex parsing of node ids).
-ce-identity = { path = "../ce/crates/ce-identity" }
+ce-identity = { git = "https://github.com/ce-net/ce" }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
 # Stream combinators for the real-time SSE-driven event loop (drains CeClient::messages_stream).
@@ -48,5 +48,5 @@ directories = "5"
 
 [dev-dependencies]
 # Identity is needed by tests to forge capability chains and authenticated senders.
-ce-identity = { path = "../ce/crates/ce-identity" }
+ce-identity = { git = "https://github.com/ce-net/ce" }
 proptest = "1"

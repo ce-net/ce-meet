@@ -283,7 +283,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
+    use ce_iam_core::{Caveats, Resource, SignedCapability, encode_chain};
     use ce_identity::Identity;
     use std::sync::atomic::{AtomicU64, Ordering};
 
